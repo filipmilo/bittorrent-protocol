@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+#[derive(Clone)]
 pub enum BencodeState {
     String(String),
     Dictionary(HashMap<String, BencodeState>),
@@ -8,6 +9,36 @@ pub enum BencodeState {
 }
 
 pub type BencodedDictionary = HashMap<String, BencodeState>;
+
+impl BencodeState {
+    pub fn try_into_string(&self) -> Result<String, String> {
+        match self {
+            BencodeState::String(value) => Ok(value.clone()),
+            _ => Err(String::from("Error parsing string!")),
+        }
+    }
+
+    pub fn try_into_int(&self) -> Result<i32, String> {
+        match self {
+            BencodeState::Int(value) => Ok(*value),
+            _ => Err(String::from("Error parsing integer!")),
+        }
+    }
+
+    pub fn try_into_list(&self) -> Result<Vec<BencodeState>, String> {
+        match self {
+            BencodeState::List(value) => Ok(value.clone()),
+            _ => Err(String::from("Error parsing list!")),
+        }
+    }
+
+    pub fn try_into_dict(&self) -> Result<BencodedDictionary, String> {
+        match self {
+            BencodeState::Dictionary(value) => Ok(value.clone()),
+            _ => Err(String::from("Error parsing dictionary")),
+        }
+    }
+}
 
 pub struct Bencode {}
 

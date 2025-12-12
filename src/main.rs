@@ -1,26 +1,24 @@
-use core::panic;
-
-use crate::bencode::{Bencode, BencodeState, BencodedDictionary};
+use crate::bencode::{Bencode, BencodedDictionary};
 
 mod bencode;
-
-fn parse_bencode_result<T>(result: BencodeState) -> T {}
 
 struct TorrentFile {
     announce: String,
     info: Info,
 }
 
-impl TorrentFile {
-    fn parse(object: BencodedDictionary) -> TorrentFile {
-        if !object.contains_key("announce") || !object.contains_key("info") {
-            panic!("Error parsing TorrentFile, not valid.");
+impl TryFrom<BencodedDictionary> for TorrentFile {
+    type Error = String;
+
+    fn try_from(value: BencodedDictionary) -> Result<Self, Self::Error> {
+        if !value.contains_key("announce") || !value.contains_key("info") {
+            return Err(String::from("Error parsing TorrentFile, not valid."));
         }
 
-        TorrentFile {
-            announce: object.get("announce").unwrap(),
-            info: Info::parse(object.get("info").unwrap()),
-        }
+        Ok(TorrentFile {
+            announce: value.get("announce").unwrap().try_into_string()?,
+            info: Info::try_from(value.get("info").unwrap().try_into_dict()?)?,
+        })
     }
 }
 
@@ -32,20 +30,30 @@ struct Info {
     files: Option<Files>,
 }
 
-impl Info {
-    fn parse(object: BencodedDictionary) -> Info {
-        if !object.contains_key("name")
-            || !object.contains_key("piece_length")
-            || !object.contains_key("pieces")
+impl TryFrom<BencodedDictionary> for Info {
+    type Error = String;
+
+    fn try_from(value: BencodedDictionary) -> Result<Self, Self::Error> {
+        if !value.contains_key("name")
+            || !value.contains_key("piece_length")
+            || !value.contains_key("pieces")
         {
-            panic!("Error parsing TorrentFile.Info, not valid.");
+            return Err(String::from("Error parsing Info, not valid."));
         }
 
-        Info {
-            name: object.get("name").unwrap(),
-            piece_length: object.get("piece_length").unwrap(),
-            pieces: object.get("pieces").unwrap(),
-        }
+        Ok(Info {
+            name: value.get("name").unwrap().try_into_string()?,
+            piece_length: value.get("piece_length").unwrap().try_into_int()?,
+            pieces: value.get("pieces").unwrap().try_into_string()?,
+            length: match value.get("length") {
+                Some(val) => Some(val.try_into_int()?),
+                None => None,
+            },
+            files: match value.get("files") {
+                Some(val) => Some(Files::try_from(val.try_into_dict()?)?),
+                None => None,
+            },
+        })
     }
 }
 
@@ -54,28 +62,28 @@ struct Files {
     path: String,
 }
 
-impl Files {
-    fn parse(object: BencodedDictionary) -> Files {
-        if !object.contains_key("length") || !object.contains_key("path") {
-            panic!("Error parsing TorrentFile.Info.Files, not valid.");
+impl TryFrom<BencodedDictionary> for Files {
+    type Error = String;
+
+    fn try_from(value: BencodedDictionary) -> Result<Self, Self::Error> {
+        if !value.contains_key("length") || !value.contains_key("path") {
+            return Err(String::from("Error parsing Files, not valid."));
         }
 
-        Files {
-            length: object.get("length").unwrap(),
-            path: object.get("path").unwrap(),
-        }
+        Ok(Files {
+            length: value.get("length").unwrap().try_into_int()?,
+            path: value.get("path").unwrap().try_into_string()?,
+        })
     }
 }
 
-fn parse_file(file: Vec<char>) -> TorrentFile {
+fn parse_file(file: Vec<char>) -> Result<TorrentFile, String> {
     let decoded_dictionary = Bencode::decode_dict(file);
 
-    TorrentFile::parse(decoded_dictionary)
+    TorrentFile::try_from(decoded_dictionary)
 }
 
 fn main() {
-    println!("Hello, world!");
-
     let file = std::fs::read_to_string("../torrents/archlinux-2025.10.01-x86_64.iso.torrent")
         .expect("Can't open torrent file.")
         .chars()
