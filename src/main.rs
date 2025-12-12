@@ -2,6 +2,7 @@ use crate::bencode::{Bencode, BencodedDictionary};
 
 mod bencode;
 
+#[derive(Debug)]
 struct TorrentFile {
     announce: String,
     info: Info,
@@ -22,6 +23,7 @@ impl TryFrom<BencodedDictionary> for TorrentFile {
     }
 }
 
+#[derive(Debug)]
 struct Info {
     name: String,
     piece_length: i32,
@@ -57,6 +59,7 @@ impl TryFrom<BencodedDictionary> for Info {
     }
 }
 
+#[derive(Debug)]
 struct Files {
     length: i32,
     path: String,
@@ -90,4 +93,9 @@ fn main() {
         .collect::<Vec<char>>();
 
     let torrent = parse_file(file);
+
+    match torrent {
+        Ok(value) => println!("{:?}", value),
+        Err(err) => println!("Error: {:?}", err),
+    }
 }

@@ -74,11 +74,86 @@ impl Bencode {
     }
 
     fn parse_list(slice: &Vec<char>, offset: usize) -> (usize, Vec<BencodeState>) {
-        todo!()
+        let mut list: Vec<BencodeState> = vec![];
+        let mut new_offset = offset + 1;
+
+        loop {
+            if slice[new_offset] == 'e' {
+                new_offset += 1;
+                break;
+            }
+
+            let (value_end, value) = match slice[new_offset] {
+                'd' => {
+                    let (o, v) = Self::parse_dictionary(slice, new_offset);
+
+                    (o, BencodeState::Dictionary(v))
+                }
+                'i' => {
+                    let (o, v) = Self::parse_int(slice, new_offset);
+
+                    (o, BencodeState::Int(v))
+                }
+                'l' => {
+                    let (o, v) = Self::parse_list(slice, new_offset);
+
+                    (o, BencodeState::List(v))
+                }
+                _ => {
+                    let (o, v) = Self::parse_string(slice, new_offset);
+
+                    (o, BencodeState::String(v))
+                }
+            };
+
+            new_offset = value_end;
+            list.push(value);
+        }
+
+        (new_offset, list)
     }
 
     fn parse_dictionary(slice: &Vec<char>, offset: usize) -> (usize, BencodedDictionary) {
-        todo!()
+        let mut dictionary: BencodedDictionary = HashMap::new();
+
+        let mut new_offset = offset + 1;
+
+        loop {
+            if slice[new_offset] == 'e' {
+                new_offset += 1;
+                break;
+            }
+
+            let (key_end, key) = Self::parse_string(slice, new_offset);
+
+            let (value_end, value) = match slice[key_end] {
+                'd' => {
+                    let (o, v) = Self::parse_dictionary(slice, key_end);
+
+                    (o, BencodeState::Dictionary(v))
+                }
+                'i' => {
+                    let (o, v) = Self::parse_int(slice, key_end);
+
+                    (o, BencodeState::Int(v))
+                }
+                'l' => {
+                    let (o, v) = Self::parse_list(slice, key_end);
+
+                    (o, BencodeState::List(v))
+                }
+                _ => {
+                    let (o, v) = Self::parse_string(slice, key_end);
+
+                    (o, BencodeState::String(v))
+                }
+            };
+
+            new_offset = value_end;
+            dictionary.insert(key, value);
+        }
+
+        (new_offset, dictionary)
     }
 
     pub fn decode_dict(slice: Vec<char>) -> BencodedDictionary {
