@@ -3,7 +3,7 @@ use std::collections::HashMap;
 #[derive(Clone, Debug)]
 pub enum BencodeState {
     String(Vec<u8>),
-    Dictionary(HashMap<String, BencodeState>),
+    Dictionary(HashMap<String, BencodeState>, Vec<u8>),
     List(Vec<BencodeState>),
     Int(u64),
 }
@@ -34,9 +34,9 @@ impl BencodeState {
         }
     }
 
-    pub fn try_into_dict(&self) -> Result<HashMap<String, BencodeState>, String> {
+    pub fn try_into_dict(&self) -> Result<(HashMap<String, BencodeState>, Vec<u8>), String> {
         match self {
-            BencodeState::Dictionary(value) => Ok(value.clone()),
+            BencodeState::Dictionary(value, raw) => Ok((value.clone(), raw.clone())),
             _ => Err(String::from("Error parsing dictionary")),
         }
     }
@@ -90,9 +90,9 @@ impl Bencode {
 
             let (value_end, value) = match slice[new_offset] {
                 b'd' => {
-                    let (o, v) = Self::parse_dictionary(slice, new_offset);
+                    let (o, v, r) = Self::parse_dictionary(slice, new_offset);
 
-                    (o, BencodeState::Dictionary(v))
+                    (o, BencodeState::Dictionary(v, r))
                 }
                 b'i' => {
                     let (o, v) = Self::parse_int(slice, new_offset);
@@ -118,12 +118,15 @@ impl Bencode {
         (new_offset, list)
     }
 
-    fn parse_dictionary(slice: &Vec<u8>, offset: usize) -> (usize, BencodedDictionary) {
+    fn parse_dictionary(slice: &Vec<u8>, offset: usize) -> (usize, BencodedDictionary, Vec<u8>) {
         let mut dictionary: BencodedDictionary = HashMap::new();
+        let mut raw: Vec<u8> = vec![slice[offset]];
 
         let mut new_offset = offset + 1;
 
         loop {
+            raw.push(slice[new_offset]);
+
             if slice[new_offset] == b'e' {
                 new_offset += 1;
                 break;
@@ -133,9 +136,9 @@ impl Bencode {
 
             let (value_end, value) = match slice[key_end] {
                 b'd' => {
-                    let (o, v) = Self::parse_dictionary(slice, key_end);
+                    let (o, v, r) = Self::parse_dictionary(slice, key_end);
 
-                    (o, BencodeState::Dictionary(v))
+                    (o, BencodeState::Dictionary(v, r))
                 }
                 b'i' => {
                     let (o, v) = Self::parse_int(slice, key_end);
@@ -161,7 +164,7 @@ impl Bencode {
             );
         }
 
-        (new_offset, dictionary)
+        (new_offset, dictionary, raw)
     }
 
     pub fn decode_dict(slice: Vec<u8>) -> BencodedDictionary {
