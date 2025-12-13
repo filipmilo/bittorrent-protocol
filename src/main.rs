@@ -26,9 +26,9 @@ impl TryFrom<BencodedDictionary> for TorrentFile {
 #[derive(Debug)]
 struct Info {
     name: String,
-    piece_length: i32,
+    piece_length: u64,
     pieces: String,
-    length: Option<i32>,
+    length: Option<u64>,
     files: Option<Files>,
 }
 
@@ -37,7 +37,7 @@ impl TryFrom<BencodedDictionary> for Info {
 
     fn try_from(value: BencodedDictionary) -> Result<Self, Self::Error> {
         if !value.contains_key("name")
-            || !value.contains_key("piece_length")
+            || !value.contains_key("piece length")
             || !value.contains_key("pieces")
         {
             return Err(String::from("Error parsing Info, not valid."));
@@ -45,7 +45,7 @@ impl TryFrom<BencodedDictionary> for Info {
 
         Ok(Info {
             name: value.get("name").unwrap().try_into_string()?,
-            piece_length: value.get("piece_length").unwrap().try_into_int()?,
+            piece_length: value.get("piece length").unwrap().try_into_int()?,
             pieces: value.get("pieces").unwrap().try_into_string()?,
             length: match value.get("length") {
                 Some(val) => Some(val.try_into_int()?),
@@ -61,7 +61,7 @@ impl TryFrom<BencodedDictionary> for Info {
 
 #[derive(Debug)]
 struct Files {
-    length: i32,
+    length: u64,
     path: String,
 }
 
@@ -80,17 +80,18 @@ impl TryFrom<BencodedDictionary> for Files {
     }
 }
 
-fn parse_file(file: Vec<char>) -> Result<TorrentFile, String> {
+fn parse_file(file: Vec<u8>) -> Result<TorrentFile, String> {
     let decoded_dictionary = Bencode::decode_dict(file);
 
     TorrentFile::try_from(decoded_dictionary)
 }
 
 fn main() {
-    let file = std::fs::read_to_string("../torrents/archlinux-2025.10.01-x86_64.iso.torrent")
+    let file = std::fs::read("./torrents/ubuntu-25.10-desktop-amd64.iso.torrent")
         .expect("Can't open torrent file.")
-        .chars()
-        .collect::<Vec<char>>();
+        .iter()
+        .map(|it| it.clone())
+        .collect::<Vec<u8>>();
 
     let torrent = parse_file(file);
 

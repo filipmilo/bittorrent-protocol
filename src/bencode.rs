@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum BencodeState {
-    String(String),
+    String(Vec<u8>),
     Dictionary(HashMap<String, BencodeState>),
     List(Vec<BencodeState>),
-    Int(i32),
+    Int(u64),
 }
 
 pub type BencodedDictionary = HashMap<String, BencodeState>;
@@ -13,12 +13,14 @@ pub type BencodedDictionary = HashMap<String, BencodeState>;
 impl BencodeState {
     pub fn try_into_string(&self) -> Result<String, String> {
         match self {
-            BencodeState::String(value) => Ok(value.clone()),
+            BencodeState::String(value) => {
+                Ok(value.iter().map(|&it| char::from(it)).collect::<String>())
+            }
             _ => Err(String::from("Error parsing string!")),
         }
     }
 
-    pub fn try_into_int(&self) -> Result<i32, String> {
+    pub fn try_into_int(&self) -> Result<u64, String> {
         match self {
             BencodeState::Int(value) => Ok(*value),
             _ => Err(String::from("Error parsing integer!")),
@@ -32,7 +34,7 @@ impl BencodeState {
         }
     }
 
-    pub fn try_into_dict(&self) -> Result<BencodedDictionary, String> {
+    pub fn try_into_dict(&self) -> Result<HashMap<String, BencodeState>, String> {
         match self {
             BencodeState::Dictionary(value) => Ok(value.clone()),
             _ => Err(String::from("Error parsing dictionary")),
@@ -43,58 +45,61 @@ impl BencodeState {
 pub struct Bencode {}
 
 impl Bencode {
-    fn parse_string(slice: &Vec<char>, offset: usize) -> (usize, String) {
+    fn parse_string(slice: &Vec<u8>, offset: usize) -> (usize, Vec<u8>) {
         let length = slice
             .iter()
             .skip(offset)
-            .take_while(|&it| it.is_numeric())
+            .take_while(|&it| char::from(*it).is_numeric())
+            .map(|&it| char::from(it))
             .collect::<String>();
 
-        let new_offset = offset + length.len();
+        let new_offset = offset + length.len() + 1;
 
         let value = slice
             .iter()
             .skip(new_offset)
             .take(length.parse::<usize>().unwrap())
-            .collect::<String>();
+            .map(|v| v.clone())
+            .collect::<Vec<u8>>();
 
         (new_offset + value.len(), value)
     }
 
-    fn parse_int(slice: &Vec<char>, offset: usize) -> (usize, i32) {
+    fn parse_int(slice: &Vec<u8>, offset: usize) -> (usize, u64) {
         let new_offset = offset + 1;
 
         let value = slice
             .iter()
             .skip(new_offset)
-            .take_while(|&it| it.is_numeric())
+            .take_while(|&it| *it != b'e')
+            .map(|&it| char::from(it))
             .collect::<String>();
 
-        (new_offset + value.len() + 1, value.parse::<i32>().unwrap())
+        (new_offset + value.len() + 1, value.parse::<u64>().unwrap())
     }
 
-    fn parse_list(slice: &Vec<char>, offset: usize) -> (usize, Vec<BencodeState>) {
+    fn parse_list(slice: &Vec<u8>, offset: usize) -> (usize, Vec<BencodeState>) {
         let mut list: Vec<BencodeState> = vec![];
         let mut new_offset = offset + 1;
 
         loop {
-            if slice[new_offset] == 'e' {
+            if slice[new_offset] == b'e' {
                 new_offset += 1;
                 break;
             }
 
             let (value_end, value) = match slice[new_offset] {
-                'd' => {
+                b'd' => {
                     let (o, v) = Self::parse_dictionary(slice, new_offset);
 
                     (o, BencodeState::Dictionary(v))
                 }
-                'i' => {
+                b'i' => {
                     let (o, v) = Self::parse_int(slice, new_offset);
 
                     (o, BencodeState::Int(v))
                 }
-                'l' => {
+                b'l' => {
                     let (o, v) = Self::parse_list(slice, new_offset);
 
                     (o, BencodeState::List(v))
@@ -113,13 +118,13 @@ impl Bencode {
         (new_offset, list)
     }
 
-    fn parse_dictionary(slice: &Vec<char>, offset: usize) -> (usize, BencodedDictionary) {
+    fn parse_dictionary(slice: &Vec<u8>, offset: usize) -> (usize, BencodedDictionary) {
         let mut dictionary: BencodedDictionary = HashMap::new();
 
         let mut new_offset = offset + 1;
 
         loop {
-            if slice[new_offset] == 'e' {
+            if slice[new_offset] == b'e' {
                 new_offset += 1;
                 break;
             }
@@ -127,17 +132,17 @@ impl Bencode {
             let (key_end, key) = Self::parse_string(slice, new_offset);
 
             let (value_end, value) = match slice[key_end] {
-                'd' => {
+                b'd' => {
                     let (o, v) = Self::parse_dictionary(slice, key_end);
 
                     (o, BencodeState::Dictionary(v))
                 }
-                'i' => {
+                b'i' => {
                     let (o, v) = Self::parse_int(slice, key_end);
 
                     (o, BencodeState::Int(v))
                 }
-                'l' => {
+                b'l' => {
                     let (o, v) = Self::parse_list(slice, key_end);
 
                     (o, BencodeState::List(v))
@@ -150,13 +155,16 @@ impl Bencode {
             };
 
             new_offset = value_end;
-            dictionary.insert(key, value);
+            dictionary.insert(
+                key.iter().map(|&it| char::from(it)).collect::<String>(),
+                value,
+            );
         }
 
         (new_offset, dictionary)
     }
 
-    pub fn decode_dict(slice: Vec<char>) -> BencodedDictionary {
+    pub fn decode_dict(slice: Vec<u8>) -> BencodedDictionary {
         Bencode::parse_dictionary(&slice, 0).1
     }
 }
