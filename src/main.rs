@@ -1,3 +1,5 @@
+use sha1::{Digest, Sha1};
+
 use crate::{
     bencode::{Bencode, BencodedDictionary},
     tracker::TrackerRequest,
@@ -97,6 +99,19 @@ fn parse_file(file: Vec<u8>) -> Result<TorrentFile, String> {
     TorrentFile::try_from(decoded_dictionary)
 }
 
+fn perform_hashing(candidate: Vec<u8>) -> String {
+    let mut hasher = Sha1::new();
+
+    hasher.update(candidate);
+
+    let result = hasher.finalize().to_ascii_lowercase();
+
+    result
+        .iter()
+        .map(|&byte| format!("%{:02X}", byte))
+        .collect::<String>()
+}
+
 #[tokio::main]
 async fn main() {
     let file = std::fs::read("./torrents/ubuntu-25.10-desktop-amd64.iso.torrent")
@@ -107,17 +122,16 @@ async fn main() {
 
     let torrent = parse_file(file);
 
-    match torrent {
-        Ok(value) => println!("{:?}", value),
-        Err(err) => println!("Error: {:?}", err),
-    }
-
     if let Ok(torr) = torrent {
-        let info_hash = "";
-        let tracker_request = TrackerRequest::from(torr.announce, info_hash, "", 6881);
+        let info_hash = perform_hashing(torr.info_raw);
 
-        let response = tracker_request.fetch_peer_info().await?;
+        println!("{:?}", info_hash);
+        let tracker_request = TrackerRequest::from(torr.announce, info_hash, "".to_string(), 6881);
 
-        println!("{:?}", response);
+        let response = tracker_request.fetch_peer_info().await;
+
+        if let Ok(resp) = response {
+            println!("{:?}", resp);
+        }
     }
 }
