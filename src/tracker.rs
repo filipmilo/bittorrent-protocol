@@ -1,3 +1,5 @@
+use std::ffi::os_str::Display;
+
 use reqwest::Error;
 
 use crate::bencode::{Bencode, BencodedDictionary};
@@ -19,7 +21,7 @@ impl Event {
 }
 
 #[derive(Debug)]
-struct Peer {
+pub struct Peer {
     peer_id: String,
     ip: String,
     port: u64,
@@ -45,9 +47,9 @@ impl TryFrom<BencodedDictionary> for Peer {
 }
 
 #[derive(Debug)]
-struct PeerInfo {
-    interval: u64,
-    peers: Vec<Peer>,
+pub struct PeerInfo {
+    pub interval: u64,
+    pub peers: Vec<Peer>,
 }
 
 impl TryFrom<BencodedDictionary> for PeerInfo {
@@ -95,22 +97,22 @@ pub struct TrackerRequest {
 }
 
 impl TrackerRequest {
-    pub fn from(url: String, info_hash: String, peer_id: String, port: u32) -> Self {
+    pub fn from(url: String, info_hash: String, peer_id: String, port: u32, left: u64) -> Self {
         Self {
             url,
             info_hash,
             peer_id,
             port,
+            left: left.to_string(),
             uploaded: "0".into(),
             downloaded: "0".into(),
-            left: "0".into(),
             event: None,
         }
     }
 
     pub async fn fetch_peer_info(&self) -> Result<TrackerResponse, Error> {
         let mut url = format!(
-            "{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact=1",
+            "{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}",
             self.url,
             self.info_hash,
             self.peer_id,

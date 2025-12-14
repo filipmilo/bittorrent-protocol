@@ -3,7 +3,7 @@ use sha1::{Digest, Sha1};
 
 use crate::{
     bencode::{Bencode, BencodedDictionary},
-    tracker::TrackerRequest,
+    tracker::{TrackerRequest, TrackerResponse},
 };
 
 mod bencode;
@@ -105,7 +105,7 @@ fn perform_hashing(candidate: Vec<u8>) -> String {
 
     hasher.update(candidate);
 
-    let result = hasher.finalize().to_ascii_lowercase();
+    let result = hasher.finalize();
 
     result
         .iter()
@@ -124,26 +124,34 @@ async fn main() {
     let torrent = parse_file(file);
 
     if let Ok(torr) = torrent {
-        println!(
-            "{:?}",
-            torr.info_raw
-                .iter()
-                .map(|&byte| char::from(byte))
-                .collect::<String>()
-        );
         let info_hash = perform_hashing(torr.info_raw);
 
-        let peer_id = nanoid!(20);
+        let peer_id = format!("-RS0001-{}", nanoid!(12));
 
-        println!("{:?}", info_hash);
-        println!("{:?}", peer_id);
-
-        let tracker_request = TrackerRequest::from(torr.announce, info_hash, peer_id, 6881);
+        let tracker_request = TrackerRequest::from(
+            torr.announce,
+            info_hash,
+            peer_id,
+            6881,
+            torr.info.length.unwrap(),
+        );
 
         let response = tracker_request.fetch_peer_info().await;
 
         if let Ok(resp) = response {
-            println!("{:?}", resp);
+            match resp {
+                TrackerResponse::Success(peer_info) => {
+                    println!("Interval {}", peer_info.interval);
+
+                    for peer in peer_info.peers {
+                        println!("{:#?}", peer);
+                    }
+                }
+
+                TrackerResponse::Failure(err) => {
+                    println!("{:?}", err);
+                }
+            }
         }
     }
 }
