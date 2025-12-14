@@ -1,3 +1,4 @@
+use nanoid::nanoid;
 use sha1::{Digest, Sha1};
 
 use crate::{
@@ -108,7 +109,7 @@ fn perform_hashing(candidate: Vec<u8>) -> String {
 
     result
         .iter()
-        .map(|&byte| format!("%{:02X}", byte))
+        .map(|&byte| format!("%{:02x}", byte))
         .collect::<String>()
 }
 
@@ -123,10 +124,21 @@ async fn main() {
     let torrent = parse_file(file);
 
     if let Ok(torr) = torrent {
+        println!(
+            "{:?}",
+            torr.info_raw
+                .iter()
+                .map(|&byte| char::from(byte))
+                .collect::<String>()
+        );
         let info_hash = perform_hashing(torr.info_raw);
 
+        let peer_id = nanoid!(20);
+
         println!("{:?}", info_hash);
-        let tracker_request = TrackerRequest::from(torr.announce, info_hash, "".to_string(), 6881);
+        println!("{:?}", peer_id);
+
+        let tracker_request = TrackerRequest::from(torr.announce, info_hash, peer_id, 6881);
 
         let response = tracker_request.fetch_peer_info().await;
 

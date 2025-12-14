@@ -12,3 +12,5 @@
 - If a peer does not have pieces my peer needs, send them 'NOT INTERESTED' even if my peer is 'CHOKED'
 - If a peer has pieces my peer need, send them 'INTERESTED' even if my peer is 'CHOKED'
 
+
+- We are using url percentage encoding on the info_hash field because of problematic urls
