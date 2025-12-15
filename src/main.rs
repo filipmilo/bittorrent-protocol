@@ -1,12 +1,16 @@
+use std::net::IpAddr;
+
 use nanoid::nanoid;
 use sha1::{Digest, Sha1};
 
 use crate::{
     bencode::{Bencode, BencodedDictionary},
+    protocol::start_connection,
     tracker::{TrackerRequest, TrackerResponse},
 };
 
 mod bencode;
+mod protocol;
 mod tracker;
 
 #[derive(Debug)]
@@ -100,17 +104,20 @@ fn parse_file(file: Vec<u8>) -> Result<TorrentFile, String> {
     TorrentFile::try_from(decoded_dictionary)
 }
 
-fn perform_hashing(candidate: Vec<u8>) -> String {
+fn perform_hashing(candidate: Vec<u8>) -> (Vec<u8>, String) {
     let mut hasher = Sha1::new();
 
     hasher.update(candidate);
 
     let result = hasher.finalize();
 
-    result
-        .iter()
-        .map(|&byte| format!("%{:02x}", byte))
-        .collect::<String>()
+    (
+        result.iter().map(|val| val.clone()).collect::<Vec<u8>>(),
+        result
+            .iter()
+            .map(|&byte| format!("%{:02x}", byte))
+            .collect::<String>(),
+    )
 }
 
 #[tokio::main]
@@ -124,14 +131,14 @@ async fn main() {
     let torrent = parse_file(file);
 
     if let Ok(torr) = torrent {
-        let info_hash = perform_hashing(torr.info_raw);
+        let (raw_info_hash, info_hash) = perform_hashing(torr.info_raw);
 
         let peer_id = format!("-RS0001-{}", nanoid!(12));
 
         let tracker_request = TrackerRequest::from(
             torr.announce,
             info_hash,
-            peer_id,
+            peer_id.clone(),
             6881,
             torr.info.length.unwrap(),
         );
@@ -141,10 +148,20 @@ async fn main() {
         if let Ok(resp) = response {
             match resp {
                 TrackerResponse::Success(peer_info) => {
-                    println!("Interval {}", peer_info.interval);
+                    println!("Interval -> {}", peer_info.interval);
 
-                    for peer in peer_info.peers {
-                        println!("{:#?}", peer);
+                    let ip_v4_peers = peer_info.peers.iter().filter(|peer| !peer.ip.contains(":"));
+
+                    for peer in ip_v4_peers {
+                        println!("Connecting to -> {:#?}", peer);
+
+                        let _ = start_connection(
+                            &raw_info_hash,
+                            peer_id.as_bytes(),
+                            &peer.ip,
+                            &peer.port,
+                        )
+                        .await;
                     }
                 }
 

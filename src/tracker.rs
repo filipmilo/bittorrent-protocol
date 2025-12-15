@@ -23,8 +23,8 @@ impl Event {
 #[derive(Debug)]
 pub struct Peer {
     peer_id: String,
-    ip: String,
-    port: u64,
+    pub ip: String,
+    pub port: u64,
 }
 
 impl TryFrom<BencodedDictionary> for Peer {
