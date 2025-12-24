@@ -5,7 +5,7 @@ use sha1::{Digest, Sha1};
 
 use crate::{
     bencode::{Bencode, BencodedDictionary},
-    protocol::start_connection,
+    protocol::Connection,
     tracker::{TrackerRequest, TrackerResponse},
 };
 
@@ -155,13 +155,22 @@ async fn main() {
                     for peer in ip_v4_peers {
                         println!("Connecting to -> {:#?}", peer);
 
-                        let _ = start_connection(
+                        let result = Connection::initialize(
                             &raw_info_hash,
                             peer_id.as_bytes(),
                             &peer.ip,
                             &peer.port,
                         )
                         .await;
+
+                        match result {
+                            Ok(mut conn) => {
+                                let _ = conn.read_message();
+                            }
+                            Err(err) => {
+                                println!("{:?}", err);
+                            }
+                        }
                     }
                 }
 

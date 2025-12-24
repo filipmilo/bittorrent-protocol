@@ -14,3 +14,9 @@
 
 
 - We are using url percentage encoding on the info_hash field because of problematic urls
+- Handshaking is done by sending a 68 len byte array to the peer, its in the following format:
+  `19 + b'BitTorrent protocol' + info_hash_raw + peer_id_raw`
+
+
+- Using sparse files we can insure we seek to a file location with random pieces and the space between wont be allocated.
+- Use for example a json file that tracks state of downloaded pieces.
