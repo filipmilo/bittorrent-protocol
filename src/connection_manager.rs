@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use futures::future::join_all;
 use tokio::sync::mpsc;
 
@@ -16,7 +18,6 @@ pub enum ConnectionMessage {
 
 #[derive(Debug)]
 pub struct ConnectionManager {
-    connections: Vec<Connection>,
     piece_hashes: Vec<String>,
     tracker_interval: u64,
 
@@ -55,22 +56,23 @@ impl ConnectionManager {
         .filter_map(|conn| conn)
         .collect::<Vec<Connection>>();
 
+        println!("{:#?}", connections);
+        println!("{:#?}", tracker_interval);
+
+        for mut conn in connections {
+            tokio::spawn(async move { conn.read_message().await });
+        }
+
         ConnectionManager {
             rx,
             tx,
-            connections,
             piece_hashes,
             tracker_interval,
         }
     }
 
-    pub async fn download(&self) {
-        println!("{:#?}", self.connections);
-        println!("{:#?}", self.tracker_interval);
-
-        let (tx, mut rx) = mpsc::channel::<ConnectionMessage>(100);
-
-        while let Some(msg) = rx.recv().await {
+    pub async fn download(&mut self) {
+        while let Some(msg) = self.rx.recv().await {
             match msg {
                 ConnectionMessage::PiecesAvailable(pieces) => {
                     println!("{:?}", pieces);
