@@ -19,6 +19,12 @@ impl BencodeState {
             _ => Err(String::from("Error parsing string!")),
         }
     }
+    pub fn try_into_string_vec(&self) -> Result<Vec<u8>, String> {
+        match self {
+            BencodeState::String(value, _) => Ok(value.clone()),
+            _ => Err(String::from("Error parsing string vec!")),
+        }
+    }
 
     pub fn try_into_int(&self) -> Result<u64, String> {
         match self {

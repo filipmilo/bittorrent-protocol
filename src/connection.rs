@@ -1,9 +1,10 @@
-use std::{fmt::write, io::Bytes};
-
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    sync::mpsc,
 };
+
+use crate::connection_manager::ConnectionMessage;
 
 enum Messages {
     Choke,
@@ -35,11 +36,14 @@ impl Messages {
     }
 }
 
+#[derive(Debug)]
 pub struct Connection {
     stream: TcpStream,
     choked: bool,
     not_interested: bool,
     available_pieces: Vec<usize>,
+
+    tx: mpsc::Sender<ConnectionMessage>,
 }
 
 impl Connection {
@@ -48,10 +52,11 @@ impl Connection {
         raw_peer_id: &[u8],
         ip: &String,
         port: &u64,
-    ) -> std::io::Result<Connection> {
+        tx: mpsc::Sender<ConnectionMessage>,
+    ) -> std::io::Result<Self> {
         let mut stream = TcpStream::connect(format!("{}:{}", ip, port)).await?;
 
-        let handshake = construct_handshake(raw_info_hash, raw_peer_id);
+        let handshake = Self::construct_handshake(raw_info_hash, raw_peer_id);
         let mut data = vec![0; 68];
 
         stream.write(&handshake).await?;
@@ -67,6 +72,7 @@ impl Connection {
         println!("{}", success_message);
 
         Ok(Connection {
+            tx,
             stream,
             choked: true,
             not_interested: true,
@@ -75,9 +81,8 @@ impl Connection {
     }
 
     pub async fn read_message(&mut self) -> std::io::Result<()> {
+        let mut length_data = vec![0u8; 4];
         loop {
-            let mut length_data = vec![0u8; 4];
-
             self.stream.read_exact(&mut length_data).await?;
 
             println!("{:?}", length_data);
@@ -95,22 +100,19 @@ impl Connection {
             }
         }
     }
+
+    fn construct_handshake(raw_info_hash: &[u8], raw_peer_id: &[u8]) -> Vec<u8> {
+        let mut handshake = Vec::with_capacity(68);
+
+        handshake.push(19);
+        handshake.extend_from_slice(b"BitTorrent protocol");
+
+        handshake.extend_from_slice(&[0u8; 8]);
+
+        handshake.extend_from_slice(raw_info_hash);
+
+        handshake.extend_from_slice(raw_peer_id);
+
+        handshake
+    }
 }
-
-fn construct_handshake(raw_info_hash: &[u8], raw_peer_id: &[u8]) -> Vec<u8> {
-    let mut handshake = Vec::with_capacity(68);
-
-    handshake.push(19);
-    handshake.extend_from_slice(b"BitTorrent protocol");
-
-    handshake.extend_from_slice(&[0u8; 8]);
-
-    handshake.extend_from_slice(raw_info_hash);
-
-    handshake.extend_from_slice(raw_peer_id);
-
-    handshake
-}
-
-// TODO: Create state machine that will download a single piece after
-//

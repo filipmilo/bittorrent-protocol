@@ -1,16 +1,15 @@
-use std::net::IpAddr;
-
 use nanoid::nanoid;
 use sha1::{Digest, Sha1};
 
 use crate::{
     bencode::{Bencode, BencodedDictionary},
-    protocol::Connection,
-    tracker::{TrackerRequest, TrackerResponse},
+    connection_manager::ConnectionManager,
+    tracker::{Peer, TrackerRequest, TrackerResponse},
 };
 
 mod bencode;
-mod protocol;
+mod connection;
+mod connection_manager;
 mod tracker;
 
 #[derive(Debug)]
@@ -42,7 +41,7 @@ impl TryFrom<BencodedDictionary> for TorrentFile {
 struct Info {
     name: String,
     piece_length: u64,
-    pieces: String,
+    pieces: Vec<u8>,
     length: Option<u64>,
     files: Option<Files>,
 }
@@ -61,7 +60,7 @@ impl TryFrom<BencodedDictionary> for Info {
         Ok(Info {
             name: value.get("name").unwrap().try_into_string()?,
             piece_length: value.get("piece length").unwrap().try_into_int()?,
-            pieces: value.get("pieces").unwrap().try_into_string()?,
+            pieces: value.get("pieces").unwrap().try_into_string_vec()?,
             length: match value.get("length") {
                 Some(val) => Some(val.try_into_int()?),
                 None => None,
@@ -131,6 +130,18 @@ async fn main() {
     let torrent = parse_file(file);
 
     if let Ok(torr) = torrent {
+        let pieces = torr
+            .info
+            .pieces
+            .chunks(20)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|&byte| format!("%{:02x}", byte))
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>();
+
         let (raw_info_hash, info_hash) = perform_hashing(torr.info_raw);
 
         let peer_id = format!("-RS0001-{}", nanoid!(12));
@@ -148,30 +159,22 @@ async fn main() {
         if let Ok(resp) = response {
             match resp {
                 TrackerResponse::Success(peer_info) => {
-                    println!("Interval -> {}", peer_info.interval);
+                    let ip_v4_peers: Vec<Peer> = peer_info
+                        .peers
+                        .into_iter()
+                        .filter(|peer| !peer.ip.contains(":"))
+                        .collect();
 
-                    let ip_v4_peers = peer_info.peers.iter().filter(|peer| !peer.ip.contains(":"));
-
-                    for peer in ip_v4_peers {
-                        println!("Connecting to -> {:#?}", peer);
-
-                        let result = Connection::initialize(
-                            &raw_info_hash,
-                            peer_id.as_bytes(),
-                            &peer.ip,
-                            &peer.port,
-                        )
-                        .await;
-
-                        match result {
-                            Ok(mut conn) => {
-                                let _ = conn.read_message();
-                            }
-                            Err(err) => {
-                                println!("{:?}", err);
-                            }
-                        }
-                    }
+                    ConnectionManager::new(
+                        &ip_v4_peers,
+                        raw_info_hash,
+                        peer_id,
+                        pieces,
+                        peer_info.interval,
+                    )
+                    .await
+                    .download()
+                    .await;
                 }
 
                 TrackerResponse::Failure(err) => {
