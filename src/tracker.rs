@@ -20,9 +20,9 @@ impl Event {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Peer {
-    peer_id: String,
+    pub peer_id: String,
     pub ip: String,
     pub port: u64,
 }

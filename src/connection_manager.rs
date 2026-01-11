@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::collections::HashMap;
 
 use futures::future::join_all;
 use tokio::sync::mpsc;
@@ -9,11 +9,14 @@ use tokio::sync::mpsc;
  * Connection should worry about peer to which is connected to and thats it, the root context will
  * access the available pieces and thats it.
  */
-use crate::{connection::Connection, tracker::Peer};
+use crate::{
+    connection::{Connection, ConnectionHandle, ConnectionMessage},
+    tracker::Peer,
+};
 
-pub enum ConnectionMessage {
+pub enum ManagerMessage {
     PieceRecieved(usize, Vec<u8>),
-    PiecesAvailable(Vec<usize>),
+    PiecesAvailable(String, usize),
 }
 
 #[derive(Debug)]
@@ -21,8 +24,10 @@ pub struct ConnectionManager {
     piece_hashes: Vec<String>,
     tracker_interval: u64,
 
-    rx: mpsc::Receiver<ConnectionMessage>,
-    tx: mpsc::Sender<ConnectionMessage>,
+    connections: HashMap<String, ConnectionHandle>,
+
+    rx: mpsc::Receiver<ManagerMessage>,
+    tx: mpsc::Sender<ManagerMessage>,
 }
 
 impl ConnectionManager {
@@ -33,14 +38,13 @@ impl ConnectionManager {
         piece_hashes: Vec<String>,
         tracker_interval: u64,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<ConnectionMessage>(100);
+        let (tx, rx) = mpsc::channel::<ManagerMessage>(100);
 
         let connections = join_all(peers.iter().map(async |peer| {
             let result = Connection::initialize(
                 &raw_info_hash,
                 peer_id.as_bytes(),
-                &peer.ip,
-                &peer.port,
+                peer.clone(),
                 tx.clone(),
             )
             .await;
@@ -59,8 +63,17 @@ impl ConnectionManager {
         println!("{:#?}", connections);
         println!("{:#?}", tracker_interval);
 
+        let handles: HashMap<String, ConnectionHandle> = connections
+            .iter()
+            .map(|conn| {
+                let handle = conn.create_handle();
+
+                (handle.peer_id.clone(), handle)
+            })
+            .collect();
+
         for mut conn in connections {
-            tokio::spawn(async move { conn.read_message().await });
+            tokio::spawn(async move { conn.serve().await });
         }
 
         ConnectionManager {
@@ -68,16 +81,25 @@ impl ConnectionManager {
             tx,
             piece_hashes,
             tracker_interval,
+            connections: handles,
         }
     }
 
     pub async fn download(&mut self) {
         while let Some(msg) = self.rx.recv().await {
             match msg {
-                ConnectionMessage::PiecesAvailable(pieces) => {
-                    println!("{:?}", pieces);
+                ManagerMessage::PiecesAvailable(peer_id, pieces) => {
+                    let conn = self.connections.get_mut(&peer_id).unwrap();
+
+                    conn.available_pieces.push(pieces);
+
+                    let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(pieces));
+
+                    // TODO: Check bitfield
+                    //
                 }
-                ConnectionMessage::PieceRecieved(_, _) => todo!(),
+
+                ManagerMessage::PieceRecieved(_, _) => todo!(),
             }
         }
 
