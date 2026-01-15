@@ -14,6 +14,37 @@ use crate::{
     tracker::Peer,
 };
 
+#[derive(Debug)]
+struct Bitfield {
+    value: Vec<u8>,
+}
+
+impl Bitfield {
+    pub fn new(piece_number: usize) -> Self {
+        Self {
+            value: vec![0; (piece_number as f64 / 8.0).ceil() as usize],
+        }
+    }
+
+    pub fn check_piece(&self, piece_index: usize) -> bool {
+        let byte_index = piece_index / 8;
+        let bit_index = piece_index % 8;
+
+        let mask = 1 << (7 - bit_index);
+
+        return (self.value[byte_index] & mask) == 1;
+    }
+
+    pub fn set_downloaded(&mut self, piece_index: usize) {
+        let byte_index = piece_index / 8;
+        let bit_index = piece_index % 8;
+
+        let mask = 1 << (7 - bit_index);
+
+        self.value[byte_index] |= mask;
+    }
+}
+
 pub enum ManagerMessage {
     PieceRecieved(usize, Vec<u8>),
     PiecesAvailable(String, usize),
@@ -22,6 +53,7 @@ pub enum ManagerMessage {
 #[derive(Debug)]
 pub struct ConnectionManager {
     piece_hashes: Vec<String>,
+    bitfield: Bitfield,
     tracker_interval: u64,
 
     connections: HashMap<String, ConnectionHandle>,
@@ -76,9 +108,12 @@ impl ConnectionManager {
             tokio::spawn(async move { conn.serve().await });
         }
 
+        let bitfield = Bitfield::new(piece_hashes.len());
+
         ConnectionManager {
             rx,
             tx,
+            bitfield,
             piece_hashes,
             tracker_interval,
             connections: handles,
@@ -93,13 +128,19 @@ impl ConnectionManager {
 
                     conn.available_pieces.push(pieces);
 
-                    let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(pieces));
-
-                    // TODO: Check bitfield
-                    //
+                    // TODO: Check if downloaded and if not then add it to the queue
+                    if !self.bitfield.check_piece(pieces) {
+                        let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(pieces));
+                    }
                 }
 
-                ManagerMessage::PieceRecieved(_, _) => todo!(),
+                ManagerMessage::PieceRecieved(index, _) => {
+                    // TODO: Check piece hash
+
+                    // TODO: Serialize to file
+
+                    self.bitfield.set_downloaded(index);
+                }
             }
         }
 

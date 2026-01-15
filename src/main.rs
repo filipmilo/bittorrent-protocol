@@ -130,6 +130,8 @@ async fn main() {
     let torrent = parse_file(file);
 
     if let Ok(torr) = torrent {
+        println!("{:?}", torr.info.piece_length);
+
         let pieces = torr
             .info
             .pieces
