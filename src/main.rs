@@ -10,6 +10,7 @@ use crate::{
 mod bencode;
 mod connection;
 mod connection_manager;
+mod constants;
 mod tracker;
 
 #[derive(Debug)]

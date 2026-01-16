@@ -3,19 +3,13 @@ use std::collections::HashMap;
 use futures::future::join_all;
 use tokio::sync::mpsc;
 
-/*
- * NOTE: Connection Manager is meant to be a root context that will delegate work to connections,
- * keep track of downloaded pieces, saves into json format what file we have etc.
- * Connection should worry about peer to which is connected to and thats it, the root context will
- * access the available pieces and thats it.
- */
 use crate::{
     connection::{Connection, ConnectionHandle, ConnectionMessage},
     tracker::Peer,
 };
 
 #[derive(Debug)]
-struct Bitfield {
+pub struct Bitfield {
     value: Vec<u8>,
 }
 
@@ -24,6 +18,10 @@ impl Bitfield {
         Self {
             value: vec![0; (piece_number as f64 / 8.0).ceil() as usize],
         }
+    }
+
+    pub fn from(pieces: Vec<u8>) -> Self {
+        Self { value: pieces }
     }
 
     pub fn check_piece(&self, piece_index: usize) -> bool {
@@ -43,11 +41,33 @@ impl Bitfield {
 
         self.value[byte_index] |= mask;
     }
+
+    pub fn get_available_pieces(&self) -> Vec<usize> {
+        self.value
+            .iter()
+            .enumerate()
+            .flat_map(|entry| {
+                let (index, byte) = entry;
+
+                let mut indexes: Vec<usize> = vec![];
+
+                for i in 0..8 {
+                    let bit_mask = 7 - i;
+
+                    if (byte & (1 << bit_mask) == 1) {
+                        indexes.push(i + (8 * index))
+                    }
+                }
+
+                indexes
+            })
+            .collect()
+    }
 }
 
 pub enum ManagerMessage {
     PieceRecieved(usize, Vec<u8>),
-    PiecesAvailable(String, usize),
+    PiecesAvailable(String, Vec<usize>),
 }
 
 #[derive(Debug)]
@@ -126,11 +146,14 @@ impl ConnectionManager {
                 ManagerMessage::PiecesAvailable(peer_id, pieces) => {
                     let conn = self.connections.get_mut(&peer_id).unwrap();
 
-                    conn.available_pieces.push(pieces);
+                    conn.available_pieces.extend(&pieces);
 
                     // TODO: Check if downloaded and if not then add it to the queue
-                    if !self.bitfield.check_piece(pieces) {
-                        let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(pieces));
+
+                    for piece in pieces {
+                        if !self.bitfield.check_piece(piece) {
+                            let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(piece));
+                        }
                     }
                 }
 
@@ -143,9 +166,6 @@ impl ConnectionManager {
                 }
             }
         }
-
-        // TODO: Initial connections find out which peers are available
-        //
 
         // TODO: Determine peer selection strategy (random first)
 

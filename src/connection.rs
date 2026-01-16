@@ -1,8 +1,10 @@
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, ReadHalf},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::mpsc,
 };
+
+use crate::{connection_manager::Bitfield, constants::HANDSHAKE_MESSAGE};
 
 use crate::{connection_manager::ManagerMessage, tracker::Peer};
 
@@ -13,7 +15,7 @@ enum Messages {
     Interested,
     NotInterested,
     Have(usize),
-    Bitfield,
+    Bitfield(Vec<u8>),
     Request,
     Piece,
     Cancel,
@@ -28,7 +30,7 @@ impl Messages {
             2 => Self::Interested,
             3 => Self::NotInterested,
             4 => Self::Have(u32::from_be_bytes(payload.try_into().unwrap()) as usize),
-            5 => Self::Bitfield,
+            5 => Self::Bitfield(payload.iter().map(|&val| val).collect()),
             6 => Self::Request,
             7 => Self::Piece,
             8 => Self::Cancel,
@@ -142,7 +144,7 @@ impl Connection {
 
                                 let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
                                     self.peer.peer_id.clone(),
-                                    piece_index,
+                                    vec![piece_index],
                                 ));
                             }
                             Messages::Choke => {
@@ -157,6 +159,17 @@ impl Connection {
                             Messages::NotInterested => {
                                 self.not_interested = true;
                             }
+                            Messages::Bitfield(bitfield) => {
+                                let piece_indexes = Bitfield::from(bitfield).get_available_pieces();
+
+                                self.available_pieces.extend(&piece_indexes);
+
+                                let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
+                                    self.peer.peer_id.clone(),
+                                    piece_indexes,
+                                ));
+                            }
+
 
                             _ => {}
                         }
@@ -201,7 +214,7 @@ impl Connection {
         let mut handshake = Vec::with_capacity(68);
 
         handshake.push(19);
-        handshake.extend_from_slice(b"BitTorrent protocol");
+        handshake.extend_from_slice(HANDSHAKE_MESSAGE);
 
         handshake.extend_from_slice(&[0u8; 8]);
 
