@@ -1,10 +1,14 @@
+use sha1::digest::typenum::bit;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::mpsc,
 };
 
-use crate::{connection_manager::Bitfield, constants::HANDSHAKE_MESSAGE};
+use crate::{
+    connection_manager::Bitfield,
+    constants::{HANDSHAKE_MESSAGE, PIECE_SIZE},
+};
 
 use crate::{connection_manager::ManagerMessage, tracker::Peer};
 
@@ -16,9 +20,9 @@ enum Messages {
     NotInterested,
     Have(usize),
     Bitfield(Vec<u8>),
-    Request,
-    Piece,
-    Cancel,
+    Request(usize, usize, usize),
+    Piece(usize, usize, Vec<u8>),
+    Cancel(usize, usize, usize),
     KeepAlive,
 }
 
@@ -31,9 +35,28 @@ impl Messages {
             3 => Self::NotInterested,
             4 => Self::Have(u32::from_be_bytes(payload.try_into().unwrap()) as usize),
             5 => Self::Bitfield(payload.iter().map(|&val| val).collect()),
-            6 => Self::Request,
-            7 => Self::Piece,
-            8 => Self::Cancel,
+            6 => {
+                let index = usize::from_be_bytes(payload[0..4].try_into().unwrap());
+                let begin = usize::from_be_bytes(payload[4..8].try_into().unwrap());
+                let length = usize::from_be_bytes(payload[8..].try_into().unwrap());
+
+                Self::Request(index, begin, length)
+            }
+            7 => {
+                let index = usize::from_be_bytes(payload[0..4].try_into().unwrap());
+                let begin = usize::from_be_bytes(payload[4..8].try_into().unwrap());
+
+                let piece: Vec<u8> = payload[8..].iter().map(|&val| val).collect();
+
+                Self::Piece(index, begin, piece)
+            }
+            8 => {
+                let index = usize::from_be_bytes(payload[0..4].try_into().unwrap());
+                let begin = usize::from_be_bytes(payload[4..8].try_into().unwrap());
+                let length = usize::from_be_bytes(payload[8..].try_into().unwrap());
+
+                Self::Cancel(index, begin, length)
+            }
             _ => Self::KeepAlive,
         }
     }
@@ -44,8 +67,66 @@ impl Messages {
             Self::Unchoke => ([0, 0, 0, 1], vec![1]),
             Self::Interested => ([0, 0, 0, 1], vec![2]),
             Self::NotInterested => ([0, 0, 0, 1], vec![3]),
+            Self::Have(piece_index) => (
+                (*piece_index as u32).to_be_bytes(),
+                vec![4]
+                    .iter()
+                    .chain((*piece_index as u32).to_be_bytes().iter())
+                    .cloned()
+                    .collect(),
+            ),
 
-            _ => todo!(),
+            Self::Bitfield(bitfield) => (
+                (bitfield.len() as u32).to_be_bytes(),
+                vec![5].iter().chain(bitfield.iter()).cloned().collect(),
+            ),
+
+            Self::Request(index, begin, length) => {
+                let index_bytes = index.to_be_bytes();
+                let begin_bytes = begin.to_be_bytes();
+                let length_bytes = length.to_be_bytes();
+
+                let payload_length = index_bytes.len() + begin_bytes.len() + length_bytes.len() + 1;
+                let mut payload = Vec::with_capacity(payload_length);
+
+                payload.extend_from_slice(&[6]);
+                payload.extend_from_slice(&index_bytes);
+                payload.extend_from_slice(&begin_bytes);
+                payload.extend_from_slice(&length_bytes);
+
+                ((payload_length as u32).to_be_bytes(), payload)
+            }
+            Self::Piece(index, begin, piece) => {
+                let index_bytes = index.to_be_bytes();
+                let begin_bytes = begin.to_be_bytes();
+
+                let payload_length = index_bytes.len() + begin_bytes.len() + piece.len() + 1;
+                let mut payload = Vec::with_capacity(payload_length);
+
+                payload.extend_from_slice(&[7]);
+                payload.extend_from_slice(&index_bytes);
+                payload.extend_from_slice(&begin_bytes);
+                payload.extend_from_slice(&piece);
+
+                ((payload_length as u32).to_be_bytes(), payload)
+            }
+            Self::Cancel(index, begin, length) => {
+                let index_bytes = index.to_be_bytes();
+                let begin_bytes = begin.to_be_bytes();
+                let length_bytes = length.to_be_bytes();
+
+                let payload_length = index_bytes.len() + begin_bytes.len() + length_bytes.len() + 1;
+                let mut payload = Vec::with_capacity(payload_length);
+
+                payload.extend_from_slice(&[8]);
+                payload.extend_from_slice(&index_bytes);
+                payload.extend_from_slice(&begin_bytes);
+                payload.extend_from_slice(&length_bytes);
+
+                ((payload_length as u32).to_be_bytes(), payload)
+            }
+
+            Self::KeepAlive => ([0, 0, 0, 0], vec![]),
         };
 
         header.into_iter().chain(payload).collect()
@@ -181,6 +262,9 @@ impl Connection {
                     match instruction {
                         ConnectionMessage::PieceRequest(index) => {
                             Self::write_message(&mut self.stream, Messages::Interested).await;
+
+                            // TODO: Initiate a chain of pipeline requests for a piece
+                            Self::write_message(&mut self.stream, Messages::Request(index,0,PIECE_SIZE)).await;
 
                         }
                     }

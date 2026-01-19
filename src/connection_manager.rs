@@ -54,7 +54,7 @@ impl Bitfield {
                 for i in 0..8 {
                     let bit_mask = 7 - i;
 
-                    if (byte & (1 << bit_mask) == 1) {
+                    if byte & (1 << bit_mask) == 1 {
                         indexes.push(i + (8 * index))
                     }
                 }
@@ -147,8 +147,6 @@ impl ConnectionManager {
                     let conn = self.connections.get_mut(&peer_id).unwrap();
 
                     conn.available_pieces.extend(&pieces);
-
-                    // TODO: Check if downloaded and if not then add it to the queue
 
                     for piece in pieces {
                         if !self.bitfield.check_piece(piece) {
