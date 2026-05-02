@@ -1,4 +1,3 @@
-use sha1::digest::typenum::bit;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,

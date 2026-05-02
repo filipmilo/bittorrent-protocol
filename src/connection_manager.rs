@@ -30,7 +30,7 @@ impl Bitfield {
 
         let mask = 1 << (7 - bit_index);
 
-        return (self.value[byte_index] & mask) == 1;
+        return (self.value[byte_index] & mask) != 0;
     }
 
     pub fn set_downloaded(&mut self, piece_index: usize) {
@@ -54,7 +54,7 @@ impl Bitfield {
                 for i in 0..8 {
                     let bit_mask = 7 - i;
 
-                    if byte & (1 << bit_mask) == 1 {
+                    if byte & (1 << bit_mask) != 0 {
                         indexes.push(i + (8 * index))
                     }
                 }
