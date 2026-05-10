@@ -19,42 +19,46 @@ enum Messages {
     Unchoke,
     Interested,
     NotInterested,
-    Have(usize),
+    Have(u32),
     Bitfield(Vec<u8>),
-    Request(usize, usize, usize),
-    Piece(usize, usize, Vec<u8>),
-    Cancel(usize, usize, usize),
+    Request(u32, u32, u32),
+    Piece(u32, u32, Vec<u8>),
+    Cancel(u32, u32, u32),
     KeepAlive,
 }
 
 impl Messages {
+    fn keepalive() -> Self {
+        Self::KeepAlive
+    }
+
     fn from_code(code: u8, payload: &[u8]) -> Self {
         match code {
             0 => Self::Choke,
             1 => Self::Unchoke,
             2 => Self::Interested,
             3 => Self::NotInterested,
-            4 => Self::Have(u32::from_be_bytes(payload.try_into().unwrap()) as usize),
+            4 => Self::Have(u32::from_be_bytes(payload.try_into().unwrap()) as u32),
             5 => Self::Bitfield(payload.iter().map(|&val| val).collect()),
             6 => {
-                let index = usize::from_be_bytes(payload[0..4].try_into().unwrap());
-                let begin = usize::from_be_bytes(payload[4..8].try_into().unwrap());
-                let length = usize::from_be_bytes(payload[8..].try_into().unwrap());
+                let index = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+                let begin = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                let length = u32::from_be_bytes(payload[8..].try_into().unwrap());
 
                 Self::Request(index, begin, length)
             }
             7 => {
-                let index = usize::from_be_bytes(payload[0..4].try_into().unwrap());
-                let begin = usize::from_be_bytes(payload[4..8].try_into().unwrap());
+                let index = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+                let begin = u32::from_be_bytes(payload[4..8].try_into().unwrap());
 
                 let piece: Vec<u8> = payload[8..].iter().map(|&val| val).collect();
 
                 Self::Piece(index, begin, piece)
             }
             8 => {
-                let index = usize::from_be_bytes(payload[0..4].try_into().unwrap());
-                let begin = usize::from_be_bytes(payload[4..8].try_into().unwrap());
-                let length = usize::from_be_bytes(payload[8..].try_into().unwrap());
+                let index = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+                let begin = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                let length = u32::from_be_bytes(payload[8..].try_into().unwrap());
 
                 Self::Cancel(index, begin, length)
             }
@@ -133,7 +137,7 @@ impl Messages {
         header.into_iter().chain(payload).collect()
     }
 
-    fn get_request_fields(&self) -> Option<(usize, usize, usize)> {
+    fn get_request_fields(&self) -> Option<(u32, u32, u32)> {
         if let Messages::Request(index, begin, length) = self {
             return Some((*index, *begin, *length));
         }
@@ -144,7 +148,7 @@ impl Messages {
 
 #[derive(Debug)]
 pub enum ConnectionMessage {
-    PieceRequest(usize),
+    PieceRequest(u32),
 }
 
 #[derive(Debug)]
@@ -153,7 +157,7 @@ pub struct ConnectionHandle {
     pub choked: bool,
     pub not_interested: bool,
     pub is_downloading: bool,
-    pub available_pieces: Vec<usize>,
+    pub available_pieces: Vec<u32>,
 
     pub tx: mpsc::Sender<ConnectionMessage>,
 }
@@ -172,9 +176,14 @@ impl PieceProgress {
         }
     }
 
-    fn add_block(&mut self, begin: usize, block: Vec<u8>) -> bool {
-        if begin + block.len() < self.piece.len() && self.progress[begin] {
-            self.piece.splice(begin..begin, block.iter().cloned());
+    fn add_block(&mut self, begin: u32, block: Vec<u8>) -> bool {
+        let begin_indx = begin as usize;
+        let progress_indx = begin_indx / REQUEST_BLOCK_SIZE;
+
+        if begin_indx + block.len() < self.piece.len() && !self.progress[progress_indx] {
+            self.piece[begin_indx..begin_indx + block.len()].copy_from_slice(&block);
+            self.progress[progress_indx] = true;
+
             return true;
         }
         false
@@ -192,7 +201,7 @@ pub struct Connection {
     choked: bool,
     not_interested: bool,
     piece_length: usize,
-    available_pieces: Vec<usize>,
+    available_pieces: Vec<u32>,
 
     tx: mpsc::Sender<ManagerMessage>,
 
@@ -204,7 +213,7 @@ pub struct Connection {
     in_flight_requests: Vec<Messages>,
     request_block_count: usize,
 
-    in_progress: HashMap<usize, PieceProgress>,
+    in_progress: HashMap<u32, PieceProgress>,
 }
 
 impl Connection {
@@ -268,7 +277,6 @@ impl Connection {
             tokio::select! {
                 result = Self::read_message(&mut self.stream) => {
                     if let Ok(message) = result {
-                        println!("Recieved -> {:?}", message);
                         match message {
                             Messages::Have(piece_index) => {
                                 self.available_pieces.push(piece_index);
@@ -301,7 +309,7 @@ impl Connection {
                                 ));
                             }
                             Messages::Piece(index, begin, piece) => {
-                                dbg!("Got piece ->", index, begin, &piece);
+                                println!("Got piece {} {}->", index, begin);
 
                                 if let Some(position) = self.in_flight_requests.iter().position(|req| {
                                     let (idx, bgn, _) = req.get_request_fields().unwrap();
@@ -309,10 +317,10 @@ impl Connection {
                                 }) {
                                     self.in_flight_requests.remove(position);
 
-                                    let request = self.download_pipeline.pop_back().unwrap();
-
-                                    Self::write_message(&mut self.stream, &request).await;
-                                    self.in_flight_requests.push(request);
+                                    if let Some(request) = self.download_pipeline.pop_back() {
+                                        Self::write_message(&mut self.stream, &request).await;
+                                        self.in_flight_requests.push(request);
+                                    }
                                 }
 
 
@@ -325,7 +333,7 @@ impl Connection {
                                         piece_progress.piece.clone(),
                                     ));
 
-                                    dbg!(format!("Piece {} downloaded", index));
+                                    println!("Piece {} downloaded", index);
                                 }
                             }
                             _ => {}
@@ -338,10 +346,13 @@ impl Connection {
                     match instruction {
                         ConnectionMessage::PieceRequest(index) => {
                             Self::write_message(&mut self.stream, &Messages::Interested).await;
+                            self.not_interested = false;
+
+                            println!("PIECE LENGTH {}", self.piece_length);
 
                             self.in_progress.insert(index, PieceProgress::new(self.piece_length, self.request_block_count));
 
-                            let requests = (0..self.request_block_count).map(|val| Messages::Request(index, val * REQUEST_BLOCK_SIZE, REQUEST_BLOCK_SIZE)).rev();
+                            let requests = (0..self.request_block_count).map(|val| Messages::Request(index, (val * REQUEST_BLOCK_SIZE) as u32, REQUEST_BLOCK_SIZE as u32)).rev();
 
                             println!("Pipelining {} requests for piece {}", requests.len(), index);
 
@@ -351,6 +362,8 @@ impl Connection {
 
                             while self.in_flight_requests.len() < MAX_OUTBOUND_REQUESTS && self.download_pipeline.len() > 0 {
                                 let request = self.download_pipeline.pop_back().unwrap();
+
+                                println!("Sending {:?} requests for piece {}", request, index);
 
                                 Self::write_message(&mut self.stream, &request).await;
                                 self.in_flight_requests.push(request);
@@ -376,6 +389,10 @@ impl Connection {
             vec![0; u32::from_be_bytes(length_data.try_into().unwrap()) as usize];
 
         stream.read_exact(&mut message).await?;
+
+        if message.len() == 0 {
+            return Ok(Messages::keepalive());
+        }
 
         Ok(Messages::from_code(
             *message.first().unwrap(),

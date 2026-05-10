@@ -24,13 +24,13 @@ impl Bitfield {
         Self { value: pieces }
     }
 
-    pub fn check_piece(&self, piece_index: usize) -> bool {
+    pub fn check_piece(&self, piece_index: u32) -> bool {
         let byte_index = piece_index / 8;
         let bit_index = piece_index % 8;
 
         let mask = 1 << (7 - bit_index);
 
-        return (self.value[byte_index] & mask) != 0;
+        return (self.value[byte_index as usize] & mask) != 0;
     }
 
     pub fn set_downloaded(&mut self, piece_index: usize) {
@@ -42,20 +42,20 @@ impl Bitfield {
         self.value[byte_index] |= mask;
     }
 
-    pub fn get_available_pieces(&self) -> Vec<usize> {
+    pub fn get_available_pieces(&self) -> Vec<u32> {
         self.value
             .iter()
             .enumerate()
             .flat_map(|entry| {
                 let (index, byte) = entry;
 
-                let mut indexes: Vec<usize> = vec![];
+                let mut indexes: Vec<u32> = vec![];
 
                 for i in 0..8 {
                     let bit_mask = 7 - i;
 
                     if byte & (1 << bit_mask) != 0 {
-                        indexes.push(i + (8 * index))
+                        indexes.push((i + (8 * index)) as u32)
                     }
                 }
 
@@ -66,8 +66,8 @@ impl Bitfield {
 }
 
 pub enum ManagerMessage {
-    PieceRecieved(usize, Vec<u8>),
-    PiecesAvailable(String, Vec<usize>),
+    PieceRecieved(u32, Vec<u8>),
+    PiecesAvailable(String, Vec<u32>),
 }
 
 #[derive(Debug)]
@@ -167,7 +167,7 @@ impl ConnectionManager {
 
                     // TODO: Serialize to file
 
-                    self.bitfield.set_downloaded(index);
+                    self.bitfield.set_downloaded(index as usize);
                 }
             }
         }
