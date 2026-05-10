@@ -131,7 +131,10 @@ async fn main() {
     let torrent = parse_file(file);
 
     if let Ok(torr) = torrent {
-        println!("{:?}", torr.info.piece_length);
+        println!(
+            "Piece Length for this torrent :{:?}",
+            torr.info.piece_length
+        );
 
         let pieces = torr
             .info
@@ -169,6 +172,7 @@ async fn main() {
                         .collect();
 
                     ConnectionManager::new(
+                        torr.info.piece_length,
                         &ip_v4_peers,
                         raw_info_hash,
                         peer_id,

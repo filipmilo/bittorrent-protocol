@@ -1,3 +1,5 @@
+use std::collections::{HashMap, VecDeque};
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -6,7 +8,7 @@ use tokio::{
 
 use crate::{
     connection_manager::Bitfield,
-    constants::{HANDSHAKE_MESSAGE, PIECE_SIZE},
+    constants::{HANDSHAKE_MESSAGE, MAX_OUTBOUND_REQUESTS, REQUEST_BLOCK_SIZE},
 };
 
 use crate::{connection_manager::ManagerMessage, tracker::Peer};
@@ -130,6 +132,14 @@ impl Messages {
 
         header.into_iter().chain(payload).collect()
     }
+
+    fn get_request_fields(&self) -> Option<(usize, usize, usize)> {
+        if let Messages::Request(index, begin, length) = self {
+            return Some((*index, *begin, *length));
+        }
+
+        return None;
+    }
 }
 
 #[derive(Debug)]
@@ -149,21 +159,57 @@ pub struct ConnectionHandle {
 }
 
 #[derive(Debug)]
+struct PieceProgress {
+    piece: Vec<u8>,
+    progress: Vec<bool>,
+}
+
+impl PieceProgress {
+    fn new(size: usize, block_count: usize) -> Self {
+        Self {
+            piece: vec![0; size],
+            progress: vec![false; block_count],
+        }
+    }
+
+    fn add_block(&mut self, begin: usize, block: Vec<u8>) -> bool {
+        if begin + block.len() < self.piece.len() && self.progress[begin] {
+            self.piece.splice(begin..begin, block.iter().cloned());
+            return true;
+        }
+        false
+    }
+
+    fn is_finished(&self) -> bool {
+        self.progress.iter().all(|block| *block)
+    }
+}
+
+#[derive(Debug)]
 pub struct Connection {
     peer: Peer,
     stream: TcpStream,
     choked: bool,
     not_interested: bool,
+    piece_length: usize,
     available_pieces: Vec<usize>,
 
     tx: mpsc::Sender<ManagerMessage>,
 
     rx: mpsc::Receiver<ConnectionMessage>,
     conn_tx: mpsc::Sender<ConnectionMessage>,
+
+    // NOTE: Should only be a chain of Messages::Request type
+    download_pipeline: VecDeque<Messages>,
+    in_flight_requests: Vec<Messages>,
+    request_block_count: usize,
+
+    in_progress: HashMap<usize, PieceProgress>,
 }
 
 impl Connection {
     pub async fn initialize(
+        piece_length: usize,
         raw_info_hash: &[u8],
         raw_peer_id: &[u8],
         peer: Peer,
@@ -189,6 +235,8 @@ impl Connection {
         let (conn_tx, rx) = mpsc::channel::<ConnectionMessage>(100);
 
         Ok(Connection {
+            request_block_count: (piece_length) / REQUEST_BLOCK_SIZE,
+            piece_length,
             tx,
             conn_tx,
             rx,
@@ -197,6 +245,9 @@ impl Connection {
             choked: true,
             not_interested: true,
             available_pieces: vec![],
+            download_pipeline: VecDeque::new(),
+            in_flight_requests: vec![],
+            in_progress: HashMap::new(),
         })
     }
 
@@ -249,8 +300,34 @@ impl Connection {
                                     piece_indexes,
                                 ));
                             }
+                            Messages::Piece(index, begin, piece) => {
+                                dbg!("Got piece ->", index, begin, &piece);
+
+                                if let Some(position) = self.in_flight_requests.iter().position(|req| {
+                                    let (idx, bgn, _) = req.get_request_fields().unwrap();
+                                    idx == index && begin == bgn
+                                }) {
+                                    self.in_flight_requests.remove(position);
+
+                                    let request = self.download_pipeline.pop_back().unwrap();
+
+                                    Self::write_message(&mut self.stream, &request).await;
+                                    self.in_flight_requests.push(request);
+                                }
 
 
+                                let piece_progress = self.in_progress.get_mut(&index).unwrap();
+                                piece_progress.add_block(begin, piece);
+
+                                if piece_progress.is_finished() {
+                                    let _ = self.tx.try_send(ManagerMessage::PieceRecieved(
+                                        index,
+                                        piece_progress.piece.clone(),
+                                    ));
+
+                                    dbg!(format!("Piece {} downloaded", index));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -260,11 +337,24 @@ impl Connection {
 
                     match instruction {
                         ConnectionMessage::PieceRequest(index) => {
-                            Self::write_message(&mut self.stream, Messages::Interested).await;
+                            Self::write_message(&mut self.stream, &Messages::Interested).await;
 
-                            // TODO: Initiate a chain of pipeline requests for a piece
-                            Self::write_message(&mut self.stream, Messages::Request(index,0,PIECE_SIZE)).await;
+                            self.in_progress.insert(index, PieceProgress::new(self.piece_length, self.request_block_count));
 
+                            let requests = (0..self.request_block_count).map(|val| Messages::Request(index, val * REQUEST_BLOCK_SIZE, REQUEST_BLOCK_SIZE)).rev();
+
+                            println!("Pipelining {} requests for piece {}", requests.len(), index);
+
+                            for request in requests {
+                                self.download_pipeline.push_front(request);
+                            }
+
+                            while self.in_flight_requests.len() < MAX_OUTBOUND_REQUESTS && self.download_pipeline.len() > 0 {
+                                let request = self.download_pipeline.pop_back().unwrap();
+
+                                Self::write_message(&mut self.stream, &request).await;
+                                self.in_flight_requests.push(request);
+                            }
                         }
                     }
 
@@ -272,6 +362,10 @@ impl Connection {
 
             }
         }
+    }
+
+    pub fn get_peer(&self) -> Peer {
+        self.peer.clone()
     }
 
     async fn read_message(stream: &mut TcpStream) -> std::io::Result<Messages> {
@@ -289,7 +383,7 @@ impl Connection {
         ))
     }
 
-    async fn write_message(stream: &mut TcpStream, message: Messages) {
+    async fn write_message(stream: &mut TcpStream, message: &Messages) {
         let _ = stream.write_all(&message.to_bytes()).await;
     }
 

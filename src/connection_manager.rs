@@ -84,6 +84,7 @@ pub struct ConnectionManager {
 
 impl ConnectionManager {
     pub async fn new(
+        piece_length: u64,
         peers: &[Peer],
         raw_info_hash: Vec<u8>,
         peer_id: String,
@@ -94,6 +95,7 @@ impl ConnectionManager {
 
         let connections = join_all(peers.iter().map(async |peer| {
             let result = Connection::initialize(
+                piece_length as usize,
                 &raw_info_hash,
                 peer_id.as_bytes(),
                 peer.clone(),
@@ -112,8 +114,14 @@ impl ConnectionManager {
         .filter_map(|conn| conn)
         .collect::<Vec<Connection>>();
 
-        println!("{:#?}", connections);
-        println!("{:#?}", tracker_interval);
+        println!(
+            "Connected Peers: {:#?}",
+            connections
+                .iter()
+                .map(|conn| conn.get_peer())
+                .collect::<Vec<Peer>>()
+        );
+        println!("Tracker interval: {:#?}", tracker_interval);
 
         let handles: HashMap<String, ConnectionHandle> = connections
             .iter()
@@ -154,7 +162,6 @@ impl ConnectionManager {
                         }
                     }
                 }
-
                 ManagerMessage::PieceRecieved(index, _) => {
                     // TODO: Check piece hash
 
