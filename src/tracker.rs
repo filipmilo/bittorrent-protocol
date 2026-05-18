@@ -2,7 +2,10 @@ use std::ffi::os_str::Display;
 
 use reqwest::Error;
 
-use crate::bencode::{Bencode, BencodedDictionary};
+use crate::{
+    bencode::{Bencode, BencodedDictionary},
+    constants::NUMBER_OF_WANTED_PEERS,
+};
 
 enum Event {
     Started,
@@ -22,9 +25,9 @@ impl Event {
 
 #[derive(Debug, Clone)]
 pub struct Peer {
-    pub peer_id: String,
+    pub peer_id: Option<String>,
     pub ip: String,
-    pub port: u64,
+    pub port: u16,
 }
 
 impl TryFrom<BencodedDictionary> for Peer {
@@ -39,9 +42,24 @@ impl TryFrom<BencodedDictionary> for Peer {
         }
 
         Ok(Peer {
-            peer_id: value.get("peer id").unwrap().try_into_string()?,
+            peer_id: Some(value.get("peer id").unwrap().try_into_string()?),
             ip: value.get("ip").unwrap().try_into_string()?,
-            port: value.get("port").unwrap().try_into_int()?,
+            port: value.get("port").unwrap().try_into_int()? as u16,
+        })
+    }
+}
+
+impl TryFrom<&[u8]> for Peer {
+    type Error = String;
+
+    fn try_from(chunk: &[u8]) -> Result<Self, Self::Error> {
+        let ip = &chunk[0..4];
+        let port = &chunk[4..6];
+
+        Ok(Peer {
+            peer_id: None,
+            ip: format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+            port: u16::from_be_bytes(port.try_into().unwrap()),
         })
     }
 }
@@ -65,15 +83,10 @@ impl TryFrom<BencodedDictionary> for PeerInfo {
             peers: value
                 .get("peers")
                 .unwrap()
-                .try_into_list()?
-                .iter()
-                .filter_map(|bencoded_peer| match bencoded_peer.try_into_dict() {
-                    Ok((val, _)) => match Peer::try_from(val) {
-                        Ok(v) => Some(v),
-                        Err(_) => None,
-                    },
-                    Err(_) => None,
-                })
+                .try_into_string_vec()
+                .unwrap()
+                .chunks(6)
+                .map(|chunk| Peer::try_from(chunk).unwrap())
                 .collect::<Vec<Peer>>(),
         })
     }
@@ -94,6 +107,7 @@ pub struct TrackerRequest {
     downloaded: String,
     left: String,
     event: Option<Event>,
+    compact: bool,
 }
 
 impl TrackerRequest {
@@ -107,19 +121,24 @@ impl TrackerRequest {
             uploaded: "0".into(),
             downloaded: "0".into(),
             event: None,
+
+            // NOTE: Default to compact format to support larger palette of peers.
+            compact: true,
         }
     }
 
     pub async fn fetch_peer_info(&self) -> Result<TrackerResponse, Error> {
         let mut url = format!(
-            "{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}",
+            "{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact={}&numwant={}",
             self.url,
             self.info_hash,
             self.peer_id,
             self.port,
             self.uploaded,
             self.downloaded,
-            self.left
+            self.left,
+            if self.compact { 1 } else { 0 },
+            NUMBER_OF_WANTED_PEERS,
         );
 
         if let Some(event) = &self.event {
@@ -127,6 +146,8 @@ impl TrackerRequest {
         }
 
         let response = reqwest::get(url).await?.bytes().await?;
+
+        dbg!(&response);
 
         let decoded_response = Bencode::decode_dict(
             response

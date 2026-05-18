@@ -153,7 +153,7 @@ pub enum ConnectionMessage {
 
 #[derive(Debug)]
 pub struct ConnectionHandle {
-    pub peer_id: String,
+    pub peer_ip: String,
     pub choked: bool,
     pub not_interested: bool,
     pub is_downloading: bool,
@@ -262,7 +262,7 @@ impl Connection {
 
     pub fn create_handle(&self) -> ConnectionHandle {
         ConnectionHandle {
-            peer_id: self.peer.peer_id.clone(),
+            peer_ip: self.peer.ip.clone(),
             choked: self.choked,
             not_interested: self.not_interested,
             is_downloading: false,
@@ -282,7 +282,7 @@ impl Connection {
                                 self.available_pieces.push(piece_index);
 
                                 let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
-                                    self.peer.peer_id.clone(),
+                                    self.peer.ip.clone(),
                                     vec![piece_index],
                                 ));
                             }
@@ -304,7 +304,7 @@ impl Connection {
                                 self.available_pieces.extend(&piece_indexes);
 
                                 let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
-                                    self.peer.peer_id.clone(),
+                                    self.peer.ip.clone(),
                                     piece_indexes,
                                 ));
                             }

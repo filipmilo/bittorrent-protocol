@@ -139,7 +139,7 @@ impl ConnectionManager {
             .map(|conn| {
                 let handle = conn.create_handle();
 
-                (handle.peer_id.clone(), handle)
+                (handle.peer_ip.clone(), handle)
             })
             .collect();
 
@@ -163,8 +163,8 @@ impl ConnectionManager {
     pub async fn download(&mut self) {
         while let Some(msg) = self.rx.recv().await {
             match msg {
-                ManagerMessage::PiecesAvailable(peer_id, pieces) => {
-                    let conn = self.connections.get_mut(&peer_id).unwrap();
+                ManagerMessage::PiecesAvailable(peer_ip, pieces) => {
+                    let conn = self.connections.get_mut(&peer_ip).unwrap();
 
                     conn.available_pieces.extend(&pieces);
 
