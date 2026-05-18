@@ -180,7 +180,7 @@ impl PieceProgress {
         let begin_indx = begin as usize;
         let progress_indx = begin_indx / REQUEST_BLOCK_SIZE;
 
-        if begin_indx + block.len() < self.piece.len() && !self.progress[progress_indx] {
+        if begin_indx + block.len() <= self.piece.len() && !self.progress[progress_indx] {
             self.piece[begin_indx..begin_indx + block.len()].copy_from_slice(&block);
             self.progress[progress_indx] = true;
 

@@ -1,17 +1,21 @@
 use nanoid::nanoid;
-use sha1::{Digest, Sha1};
+use sha1::{Digest, Sha1, digest::generic_array::sequence::Lengthen};
 
 use crate::{
     bencode::{Bencode, BencodedDictionary},
     connection_manager::ConnectionManager,
+    file_serializer::FileSerializer,
     tracker::{Peer, TrackerRequest, TrackerResponse},
+    utils::sha1,
 };
 
 mod bencode;
 mod connection;
 mod connection_manager;
 mod constants;
+mod file_serializer;
 mod tracker;
+mod utils;
 
 #[derive(Debug)]
 struct TorrentFile {
@@ -104,20 +108,11 @@ fn parse_file(file: Vec<u8>) -> Result<TorrentFile, String> {
     TorrentFile::try_from(decoded_dictionary)
 }
 
-fn perform_hashing(candidate: Vec<u8>) -> (Vec<u8>, String) {
-    let mut hasher = Sha1::new();
-
-    hasher.update(candidate);
-
-    let result = hasher.finalize();
-
-    (
-        result.iter().map(|val| val.clone()).collect::<Vec<u8>>(),
-        result
-            .iter()
-            .map(|&byte| format!("%{:02x}", byte))
-            .collect::<String>(),
-    )
+fn open_file_serializer(info: &Info) -> Result<FileSerializer, std::io::Error> {
+    match info.length {
+        Some(length) => FileSerializer::new(&info.name, info.piece_length, length),
+        None => panic!("Multi file donwloads not supported."),
+    }
 }
 
 #[tokio::main]
@@ -136,6 +131,8 @@ async fn main() {
             torr.info.piece_length
         );
 
+        let serializer = open_file_serializer(&torr.info);
+
         let pieces = torr
             .info
             .pieces
@@ -148,7 +145,7 @@ async fn main() {
             })
             .collect::<Vec<String>>();
 
-        let (raw_info_hash, info_hash) = perform_hashing(torr.info_raw);
+        let (raw_info_hash, info_hash) = sha1(&torr.info_raw);
 
         let peer_id = format!("-RS0001-{}", nanoid!(12));
 
@@ -178,6 +175,7 @@ async fn main() {
                         peer_id,
                         pieces,
                         peer_info.interval,
+                        serializer.unwrap(),
                     )
                     .await
                     .download()

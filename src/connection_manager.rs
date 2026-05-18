@@ -5,7 +5,9 @@ use tokio::sync::mpsc;
 
 use crate::{
     connection::{Connection, ConnectionHandle, ConnectionMessage},
+    file_serializer::FileSerializer,
     tracker::Peer,
+    utils::sha1,
 };
 
 #[derive(Debug)]
@@ -63,6 +65,12 @@ impl Bitfield {
             })
             .collect()
     }
+
+    pub fn is_completed(&self) -> bool {
+        self.value
+            .iter()
+            .all(|bitfield_section| *bitfield_section == u8::MAX)
+    }
 }
 
 pub enum ManagerMessage {
@@ -80,6 +88,8 @@ pub struct ConnectionManager {
 
     rx: mpsc::Receiver<ManagerMessage>,
     tx: mpsc::Sender<ManagerMessage>,
+
+    serializer: FileSerializer,
 }
 
 impl ConnectionManager {
@@ -90,6 +100,7 @@ impl ConnectionManager {
         peer_id: String,
         piece_hashes: Vec<String>,
         tracker_interval: u64,
+        serializer: FileSerializer,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<ManagerMessage>(100);
 
@@ -144,6 +155,7 @@ impl ConnectionManager {
             bitfield,
             piece_hashes,
             tracker_interval,
+            serializer,
             connections: handles,
         }
     }
@@ -162,18 +174,29 @@ impl ConnectionManager {
                         }
                     }
                 }
-                ManagerMessage::PieceRecieved(index, _) => {
-                    // TODO: Check piece hash
+                ManagerMessage::PieceRecieved(index, piece) => {
+                    let (_, hex_hash) = sha1(&piece);
 
-                    // TODO: Serialize to file
+                    if self.piece_hashes[index as usize] != hex_hash {
+                        println!(
+                            "Piece Hash Validation Failed -> {}: {} != {}",
+                            index, self.piece_hashes[index as usize], hex_hash
+                        );
+                        break;
+                    }
 
-                    self.bitfield.set_downloaded(index as usize);
+                    if let Ok(_) = self.serializer.save_piece(index as u64, piece) {
+                        self.bitfield.set_downloaded(index as usize);
+
+                        if self.bitfield.is_completed() {
+                            print!("File download completed!");
+                            break;
+                        }
+                    }
                 }
             }
         }
 
         // TODO: Determine peer selection strategy (random first)
-
-        // TODO: Delegate peice downloading to connncetions
     }
 }
