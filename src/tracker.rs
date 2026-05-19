@@ -25,7 +25,6 @@ impl Event {
 
 #[derive(Debug, Clone)]
 pub struct Peer {
-    pub peer_id: Option<String>,
     pub ip: String,
     pub port: u16,
 }
@@ -42,7 +41,6 @@ impl TryFrom<BencodedDictionary> for Peer {
         }
 
         Ok(Peer {
-            peer_id: Some(value.get("peer id").unwrap().try_into_string()?),
             ip: value.get("ip").unwrap().try_into_string()?,
             port: value.get("port").unwrap().try_into_int()? as u16,
         })
@@ -57,7 +55,6 @@ impl TryFrom<&[u8]> for Peer {
         let port = &chunk[4..6];
 
         Ok(Peer {
-            peer_id: None,
             ip: format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
             port: u16::from_be_bytes(port.try_into().unwrap()),
         })
@@ -146,8 +143,6 @@ impl TrackerRequest {
         }
 
         let response = reqwest::get(url).await?.bytes().await?;
-
-        dbg!(&response);
 
         let decoded_response = Bencode::decode_dict(
             response

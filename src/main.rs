@@ -117,7 +117,7 @@ fn open_file_serializer(info: &Info) -> Result<FileSerializer, std::io::Error> {
 
 #[tokio::main]
 async fn main() {
-    let file = std::fs::read("./torrents/ubuntu-25.10-desktop-amd64.iso.torrent")
+    let file = std::fs::read("./torrents/debian-13.2.0-amd64-netinst.iso.torren sgt")
         .expect("Can't open torrent file.")
         .iter()
         .map(|it| it.clone())

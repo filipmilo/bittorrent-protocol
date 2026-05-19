@@ -239,7 +239,7 @@ impl Connection {
             "-> Failure"
         };
 
-        println!("{}", success_message);
+        println!("Peer: {} {}", peer.ip, success_message);
 
         let (conn_tx, rx) = mpsc::channel::<ConnectionMessage>(100);
 
