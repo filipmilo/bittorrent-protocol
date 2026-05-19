@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use futures::future::join_all;
 use tokio::sync::mpsc;
 
-use crate::{
+use super::{
     connection::{Connection, ConnectionHandle, ConnectionMessage},
     file_serializer::FileSerializer,
     tracker::Peer,

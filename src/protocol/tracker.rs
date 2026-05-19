@@ -1,8 +1,6 @@
-use std::ffi::os_str::Display;
-
 use reqwest::Error;
 
-use crate::{
+use super::{
     bencode::{Bencode, BencodedDictionary},
     constants::NUMBER_OF_WANTED_PEERS,
 };

@@ -6,12 +6,11 @@ use tokio::{
     sync::mpsc,
 };
 
-use crate::{
-    connection_manager::Bitfield,
+use super::{
+    connection_manager::{Bitfield, ManagerMessage},
     constants::{HANDSHAKE_MESSAGE, MAX_OUTBOUND_REQUESTS, REQUEST_BLOCK_SIZE},
+    tracker::Peer,
 };
-
-use crate::{connection_manager::ManagerMessage, tracker::Peer};
 
 #[derive(Debug)]
 enum Messages {
