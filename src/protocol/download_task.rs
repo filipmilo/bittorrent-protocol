@@ -1,3 +1,5 @@
+use crate::tui::app::App;
+
 use super::{
     bencode::Bencode,
     connection_manager::ConnectionManager,
@@ -8,10 +10,16 @@ use super::{
 };
 use nanoid::nanoid;
 
-pub struct DownloadTask {}
+pub struct DownloadTask {
+    progress_tx: std::sync::mpsc::Sender<crate::tui::ProgressEvent>,
+}
 
 impl DownloadTask {
-    pub async fn download(file_path: String) {
+    pub fn new(progress_tx: std::sync::mpsc::Sender<crate::tui::ProgressEvent>) -> Self {
+        Self { progress_tx }
+    }
+
+    pub async fn download(&self, file_path: String) {
         let file = std::fs::read(file_path)
             .expect("Can't open torrent file.")
             .iter()
@@ -39,6 +47,10 @@ impl DownloadTask {
                         .collect::<String>()
                 })
                 .collect::<Vec<String>>();
+
+            let _ = self.progress_tx.send(crate::tui::ProgressEvent::Started {
+                total_pieces: pieces.len(),
+            });
 
             let (raw_info_hash, info_hash) = sha1(&torr.info_raw);
 
@@ -71,6 +83,7 @@ impl DownloadTask {
                             pieces,
                             peer_info.interval,
                             serializer.unwrap(),
+                            self.progress_tx.clone(),
                         )
                         .await
                         .download()

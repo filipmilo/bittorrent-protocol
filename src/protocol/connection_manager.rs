@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use futures::future::join_all;
 use tokio::sync::mpsc;
 
+use crate::tui::ProgressEvent;
+
 use super::{
     connection::{Connection, ConnectionHandle, ConnectionMessage},
     file_serializer::FileSerializer,
@@ -90,6 +92,8 @@ pub struct ConnectionManager {
     tx: mpsc::Sender<ManagerMessage>,
 
     serializer: FileSerializer,
+
+    progress_tx: std::sync::mpsc::Sender<crate::tui::ProgressEvent>,
 }
 
 impl ConnectionManager {
@@ -101,6 +105,7 @@ impl ConnectionManager {
         piece_hashes: Vec<String>,
         tracker_interval: u64,
         serializer: FileSerializer,
+        progress_tx: std::sync::mpsc::Sender<crate::tui::ProgressEvent>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<ManagerMessage>(100);
 
@@ -156,6 +161,7 @@ impl ConnectionManager {
             piece_hashes,
             tracker_interval,
             serializer,
+            progress_tx,
             connections: handles,
         }
     }
@@ -188,8 +194,11 @@ impl ConnectionManager {
                     if let Ok(_) = self.serializer.save_piece(index as u64, piece) {
                         self.bitfield.set_downloaded(index as usize);
 
+                        let _ = self.progress_tx.send(ProgressEvent::PieceDownloaded);
+
                         if self.bitfield.is_completed() {
                             print!("File download completed!");
+                            let _ = self.progress_tx.send(ProgressEvent::Completed);
                             break;
                         }
                     }
