@@ -29,7 +29,7 @@ impl DownloadTask {
         let torrent = Self::parse_file(file);
 
         if let Ok(torr) = torrent {
-            println!(
+            tracing::info!(
                 "Piece Length for this torrent :{:?}",
                 torr.info.piece_length
             );
@@ -91,7 +91,7 @@ impl DownloadTask {
                     }
 
                     TrackerResponse::Failure(err) => {
-                        println!("{:?}", err);
+                        tracing::info!("{:?}", err);
                     }
                 }
             }

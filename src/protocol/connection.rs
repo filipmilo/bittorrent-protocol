@@ -238,7 +238,7 @@ impl Connection {
             "-> Failure"
         };
 
-        println!("Peer: {} {}", peer.ip, success_message);
+        tracing::info!("Peer: {} {}", peer.ip, success_message);
 
         let (conn_tx, rx) = mpsc::channel::<ConnectionMessage>(100);
 
@@ -308,7 +308,7 @@ impl Connection {
                                 ));
                             }
                             Messages::Piece(index, begin, piece) => {
-                                println!("Got piece {} {}->", index, begin);
+                                tracing::info!("Got piece {} {}->", index, begin);
 
                                 if let Some(position) = self.in_flight_requests.iter().position(|req| {
                                     let (idx, bgn, _) = req.get_request_fields().unwrap();
@@ -332,7 +332,7 @@ impl Connection {
                                         piece_progress.piece.clone(),
                                     ));
 
-                                    println!("Piece {} downloaded", index);
+                                    tracing::info!("Piece {} downloaded", index);
                                 }
                             }
                             _ => {}
@@ -340,20 +340,20 @@ impl Connection {
                     }
                 }
                 Some(instruction) = self.rx.recv()=> {
-                    println!("Sending -> {:?}", instruction);
+                    tracing::info!("Sending -> {:?}", instruction);
 
                     match instruction {
                         ConnectionMessage::PieceRequest(index) => {
                             Self::write_message(&mut self.stream, &Messages::Interested).await;
                             self.not_interested = false;
 
-                            println!("PIECE LENGTH {}", self.piece_length);
+                            tracing::info!("PIECE LENGTH {}", self.piece_length);
 
                             self.in_progress.insert(index, PieceProgress::new(self.piece_length, self.request_block_count));
 
                             let requests = (0..self.request_block_count).map(|val| Messages::Request(index, (val * REQUEST_BLOCK_SIZE) as u32, REQUEST_BLOCK_SIZE as u32)).rev();
 
-                            println!("Pipelining {} requests for piece {}", requests.len(), index);
+                            tracing::info!("Pipelining {} requests for piece {}", requests.len(), index);
 
                             for request in requests {
                                 self.download_pipeline.push_front(request);
@@ -362,7 +362,7 @@ impl Connection {
                             while self.in_flight_requests.len() < MAX_OUTBOUND_REQUESTS && self.download_pipeline.len() > 0 {
                                 let request = self.download_pipeline.pop_back().unwrap();
 
-                                println!("Sending {:?} requests for piece {}", request, index);
+                                tracing::info!("Sending {:?} requests for piece {}", request, index);
 
                                 Self::write_message(&mut self.stream, &request).await;
                                 self.in_flight_requests.push(request);

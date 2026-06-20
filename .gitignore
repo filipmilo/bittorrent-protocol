@@ -2,3 +2,5 @@
 /torrents
 /downloads
 dump.txt
+*.iso
+*.log

@@ -130,14 +130,14 @@ impl ConnectionManager {
         .filter_map(|conn| conn)
         .collect::<Vec<Connection>>();
 
-        println!(
+        tracing::info!(
             "Connected Peers: {:#?}",
             connections
                 .iter()
                 .map(|conn| conn.get_peer())
                 .collect::<Vec<Peer>>()
         );
-        println!("Tracker interval: {:#?}", tracker_interval);
+        tracing::info!("Tracker interval: {:#?}", tracker_interval);
 
         let handles: HashMap<String, ConnectionHandle> = connections
             .iter()
@@ -184,9 +184,11 @@ impl ConnectionManager {
                     let (_, hex_hash) = sha1(&piece);
 
                     if self.piece_hashes[index as usize] != hex_hash {
-                        println!(
+                        tracing::info!(
                             "Piece Hash Validation Failed -> {}: {} != {}",
-                            index, self.piece_hashes[index as usize], hex_hash
+                            index,
+                            self.piece_hashes[index as usize],
+                            hex_hash
                         );
                         break;
                     }
