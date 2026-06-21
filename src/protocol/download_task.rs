@@ -1,5 +1,3 @@
-use crate::tui::app::App;
-
 use super::{
     bencode::Bencode,
     connection_manager::ConnectionManager,

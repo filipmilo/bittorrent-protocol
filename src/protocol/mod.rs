@@ -4,6 +4,7 @@ mod connection_manager;
 mod constants;
 pub mod download_task;
 mod file_serializer;
+mod piece_selection;
 mod torrent_file;
 mod tracker;
 mod utils;

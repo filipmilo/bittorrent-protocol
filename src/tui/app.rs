@@ -1,9 +1,7 @@
-use std::sync::mpsc;
 use std::time::Duration;
 
 use color_eyre::Result;
 use crossterm::event::{self, KeyCode};
-use rand::distr::Distribution;
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};

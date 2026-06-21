@@ -328,6 +328,7 @@ impl Connection {
 
                                 if piece_progress.is_finished() {
                                     let _ = self.tx.try_send(ManagerMessage::PieceRecieved(
+                                        self.peer.ip.clone(),
                                         index,
                                         piece_progress.piece.clone(),
                                     ));

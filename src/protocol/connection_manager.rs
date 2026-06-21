@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use futures::future::join_all;
 use tokio::sync::mpsc;
 
-use crate::tui::ProgressEvent;
+use crate::{protocol::piece_selection::PieceSelection, tui::ProgressEvent};
 
 use super::{
     connection::{Connection, ConnectionHandle, ConnectionMessage},
@@ -76,7 +76,7 @@ impl Bitfield {
 }
 
 pub enum ManagerMessage {
-    PieceRecieved(u32, Vec<u8>),
+    PieceRecieved(String, u32, Vec<u8>),
     PiecesAvailable(String, Vec<u32>),
 }
 
@@ -94,6 +94,8 @@ pub struct ConnectionManager {
     serializer: FileSerializer,
 
     progress_tx: std::sync::mpsc::Sender<crate::tui::ProgressEvent>,
+
+    piece_availability: PieceSelection,
 }
 
 impl ConnectionManager {
@@ -109,7 +111,7 @@ impl ConnectionManager {
     ) -> Self {
         let (tx, rx) = mpsc::channel::<ManagerMessage>(100);
 
-        let connections = join_all(peers.iter().map(async |peer| {
+        let connections = join_all(peers.iter().map(|peer| async {
             let result = Connection::initialize(
                 piece_length as usize,
                 &raw_info_hash,
@@ -154,6 +156,8 @@ impl ConnectionManager {
 
         let bitfield = Bitfield::new(piece_hashes.len());
 
+        let piece_num = piece_hashes.len();
+
         ConnectionManager {
             rx,
             tx,
@@ -163,6 +167,7 @@ impl ConnectionManager {
             serializer,
             progress_tx,
             connections: handles,
+            piece_availability: PieceSelection::from(piece_num),
         }
     }
 
@@ -175,12 +180,15 @@ impl ConnectionManager {
                     conn.available_pieces.extend(&pieces);
 
                     for piece in pieces {
-                        if !self.bitfield.check_piece(piece) {
-                            let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(piece));
-                        }
+                        self.piece_availability.increment_piece(piece as usize);
                     }
+
+                    self.requrest_next_piece();
                 }
-                ManagerMessage::PieceRecieved(index, piece) => {
+                ManagerMessage::PieceRecieved(from, index, piece) => {
+                    let conn = self.connections.get_mut(&from).unwrap();
+                    conn.is_downloading = false;
+
                     let (_, hex_hash) = sha1(&piece);
 
                     if self.piece_hashes[index as usize] != hex_hash {
@@ -195,6 +203,7 @@ impl ConnectionManager {
 
                     if let Ok(_) = self.serializer.save_piece(index as u64, piece) {
                         self.bitfield.set_downloaded(index as usize);
+                        self.piece_availability.increment_download_count();
 
                         let _ = self.progress_tx.send(ProgressEvent::PieceDownloaded);
 
@@ -203,11 +212,32 @@ impl ConnectionManager {
                             let _ = self.progress_tx.send(ProgressEvent::Completed);
                             break;
                         }
+
+                        self.requrest_next_piece();
                     }
                 }
             }
         }
+    }
 
-        // TODO: Determine peer selection strategy (random first)
+    fn requrest_next_piece(&mut self) {
+        let index = self.piece_availability.get_next_piece_index(&self.bitfield) as u32;
+
+        let handle = self.connections.values_mut().find(|conn_handle| {
+            !conn_handle.is_downloading && conn_handle.available_pieces.contains(&index)
+        });
+
+        match handle {
+            Some(conn) => {
+                let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(index));
+                conn.is_downloading = true;
+            }
+            None => {
+                tracing::info!(
+                    "No connection available or all connections are downloading for piece : {}",
+                    index,
+                );
+            }
+        }
     }
 }
