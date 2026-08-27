@@ -6,7 +6,7 @@ use rand::seq::IndexedRandom;
 #[derive(Debug)]
 pub struct PieceSelection {
     piece_availability: Vec<u32>,
-    downloaded_count: u32,
+    pub downloaded_count: u32,
 }
 
 impl PieceSelection {

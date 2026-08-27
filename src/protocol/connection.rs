@@ -12,7 +12,7 @@ use super::{
     tracker::Peer,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Messages {
     Choke,
     Unchoke,
@@ -148,6 +148,7 @@ impl Messages {
 #[derive(Debug)]
 pub enum ConnectionMessage {
     PieceRequest(u32),
+    Cancel(u32),
 }
 
 #[derive(Debug)]
@@ -364,6 +365,33 @@ impl Connection {
                                 let request = self.download_pipeline.pop_back().unwrap();
 
                                 tracing::info!("Sending {:?} requests for piece {}", request, index);
+
+                                Self::write_message(&mut self.stream, &request).await;
+                                self.in_flight_requests.push(request);
+                            }
+                        }
+                        ConnectionMessage::Cancel(index) => {
+                            self.download_pipeline
+                                .retain(|msg| msg.get_request_fields().unwrap().0 != index);
+
+                            let cancelled: Vec<Messages> = self
+                                .in_flight_requests
+                                .iter()
+                                .filter(|msg| msg.get_request_fields().unwrap().0 == index)
+                                .cloned()
+                                .collect();
+
+                            for request in cancelled {
+                                let (idx, begin, length) = request.get_request_fields().unwrap();
+                                Self::write_message(&mut self.stream, &Messages::Cancel(idx, begin, length)).await;
+                            }
+
+                            self.in_flight_requests
+                                .retain(|msg| msg.get_request_fields().unwrap().0 != index);
+                            self.in_progress.remove(&index);
+
+                            while self.in_flight_requests.len() < MAX_OUTBOUND_REQUESTS && self.download_pipeline.len() > 0 {
+                                let request = self.download_pipeline.pop_back().unwrap();
 
                                 Self::write_message(&mut self.stream, &request).await;
                                 self.in_flight_requests.push(request);
