@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use futures::future::join_all;
 use tokio::sync::mpsc;
@@ -96,6 +96,9 @@ pub struct ConnectionManager {
     progress_tx: std::sync::mpsc::Sender<crate::tui::ProgressEvent>,
 
     piece_availability: PieceSelection,
+    requested_pieces: HashSet<u32>,
+    piece_owners: HashMap<u32, HashSet<String>>,
+    end_game: bool,
 }
 
 impl ConnectionManager {
@@ -168,6 +171,9 @@ impl ConnectionManager {
             progress_tx,
             connections: handles,
             piece_availability: PieceSelection::from(piece_num),
+            requested_pieces: HashSet::new(),
+            piece_owners: HashMap::new(),
+            end_game: false,
         }
     }
 
@@ -193,17 +199,19 @@ impl ConnectionManager {
 
                     if self.piece_hashes[index as usize] != hex_hash {
                         tracing::info!(
-                            "Piece Hash Validation Failed -> {}: {} != {}",
+                            "Piece Hash Validation Failed -> {}: {} != {}, discarding and re-requesting",
                             index,
                             self.piece_hashes[index as usize],
                             hex_hash
                         );
-                        break;
-                    }
 
-                    if let Ok(_) = self.serializer.save_piece(index as u64, piece) {
+                        self.requested_pieces.remove(&index);
+                        self.requrest_next_piece();
+                    } else if let Ok(_) = self.serializer.save_piece(index as u64, piece) {
                         self.bitfield.set_downloaded(index as usize);
+                        self.requested_pieces.remove(&index);
                         self.piece_availability.increment_download_count();
+                        self.finalize_piece(index, &from);
 
                         let _ = self.progress_tx.send(ProgressEvent::PieceDownloaded);
 
@@ -221,6 +229,11 @@ impl ConnectionManager {
     }
 
     fn requrest_next_piece(&mut self) {
+        if self.end_game {
+            self.broadcast_end_game_requests();
+            return;
+        }
+
         let index = self.piece_availability.get_next_piece_index(&self.bitfield) as u32;
 
         let handle = self.connections.values_mut().find(|conn_handle| {
@@ -231,12 +244,77 @@ impl ConnectionManager {
             Some(conn) => {
                 let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(index));
                 conn.is_downloading = true;
+
+                self.requested_pieces.insert(index);
+                self.piece_owners
+                    .entry(index)
+                    .or_default()
+                    .insert(conn.peer_ip.clone());
             }
             None => {
                 tracing::info!(
                     "No connection available or all connections are downloading for piece : {}",
                     index,
                 );
+            }
+        }
+
+        if self.all_pieces_requested() {
+            tracing::info!("Entering end game mode");
+            self.end_game = true;
+            self.broadcast_end_game_requests();
+        }
+    }
+
+    fn all_pieces_requested(&self) -> bool {
+        self.requested_pieces.len()
+            == self.piece_hashes.len() - (self.piece_availability.downloaded_count as usize)
+    }
+
+    // End game: every remaining piece has already been assigned to one peer,
+    // so instead of waiting on stragglers we ask every peer that holds a
+    // still-missing piece for it, and cancel the losers once one copy lands.
+    fn broadcast_end_game_requests(&mut self) {
+        for index in 0..self.piece_hashes.len() as u32 {
+            if self.bitfield.check_piece(index) {
+                continue;
+            }
+
+            let new_owners: Vec<String> = self
+                .connections
+                .values()
+                .filter(|conn| conn.available_pieces.contains(&index))
+                .map(|conn| conn.peer_ip.clone())
+                .filter(|peer_ip| {
+                    !self
+                        .piece_owners
+                        .get(&index)
+                        .is_some_and(|owners| owners.contains(peer_ip))
+                })
+                .collect();
+
+            for peer_ip in new_owners {
+                if let Some(conn) = self.connections.get(&peer_ip) {
+                    let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(index));
+                }
+
+                self.piece_owners.entry(index).or_default().insert(peer_ip);
+            }
+        }
+    }
+
+    // Cancels the piece with every peer that was also asked for it during
+    // end game, now that one copy has already been received and verified.
+    fn finalize_piece(&mut self, index: u32, downloaded_from: &str) {
+        if let Some(owners) = self.piece_owners.remove(&index) {
+            for peer_ip in owners {
+                if peer_ip == downloaded_from {
+                    continue;
+                }
+
+                if let Some(conn) = self.connections.get(&peer_ip) {
+                    let _ = conn.tx.try_send(ConnectionMessage::Cancel(index));
+                }
             }
         }
     }
