@@ -183,11 +183,7 @@ impl ConnectionManager {
 
     pub async fn download(&mut self) {
         while let Some(msg) = self.rx.recv().await {
-            let finished = self.handle_message(msg);
-
-            self.publish_peers();
-
-            if finished {
+            if self.handle_message(msg) {
                 break;
             }
         }
@@ -200,10 +196,16 @@ impl ConnectionManager {
                     conn.choked = choked;
                 }
 
+                self.publish_peers();
+
                 false
             }
             ManagerMessage::PiecesAvailable(peer_ip, pieces) => {
                 let conn = self.connections.get_mut(&peer_ip).unwrap();
+
+                // A `Have` only nudges the piece count by one, and arrives once per
+                // piece per peer. Only the first announcement adds a table row.
+                let joined_the_swarm = conn.available_pieces.is_empty();
 
                 conn.available_pieces.extend(&pieces);
 
@@ -213,6 +215,10 @@ impl ConnectionManager {
 
                 self.requrest_next_piece();
 
+                if joined_the_swarm {
+                    self.publish_peers();
+                }
+
                 false
             }
             ManagerMessage::PieceRecieved(from, index, piece) => {
@@ -221,6 +227,8 @@ impl ConnectionManager {
                 conn.current_piece = None;
 
                 if self.bitfield.check_piece(index) {
+                    self.publish_peers();
+
                     return false;
                 }
 
@@ -238,6 +246,7 @@ impl ConnectionManager {
 
                     self.requested_pieces.remove(&index);
                     self.requrest_next_piece();
+                    self.publish_peers();
 
                     return false;
                 }
@@ -258,6 +267,8 @@ impl ConnectionManager {
 
                     self.requrest_next_piece();
                 }
+
+                self.publish_peers();
 
                 false
             }

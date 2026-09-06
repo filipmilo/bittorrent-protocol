@@ -221,7 +221,9 @@ fn peer_table(app: &App) -> Table<'_> {
     )
     .block(
         Block::default()
-            .title(Line::from("Connections".bold()))
+            .title(Line::from(
+                format!("Connections ({})", app.peers.len()).bold(),
+            ))
             .padding(Padding::left(1)),
     )
 }
@@ -442,6 +444,15 @@ mod tests {
 
         assert!(text.contains("2"), "{text}");
         assert!(text.to_lowercase().contains("peer"), "{text}");
+    }
+
+    #[test]
+    fn names_the_peer_count_on_the_connections_block_so_it_survives_clipping() {
+        let (app, now) = populated_app();
+
+        let text = rendered_text(&app, now, 100, 30);
+
+        assert!(text.contains("Connections (2)"), "{text}");
     }
 
     #[test]
