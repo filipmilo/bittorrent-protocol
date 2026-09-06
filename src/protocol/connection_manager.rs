@@ -3,7 +3,10 @@ use std::collections::{HashMap, HashSet};
 use futures::future::join_all;
 use tokio::sync::mpsc;
 
-use crate::{protocol::piece_selection::PieceSelection, tui::ProgressEvent};
+use crate::{
+    protocol::piece_selection::PieceSelection,
+    tui::{PeerRow, ProgressEvent},
+};
 
 use super::{
     connection::{Connection, ConnectionHandle, ConnectionMessage},
@@ -78,6 +81,7 @@ impl Bitfield {
 pub enum ManagerMessage {
     PieceRecieved(String, u32, Vec<u8>),
     PiecesAvailable(String, Vec<u32>),
+    ChokeState(String, bool),
 }
 
 #[derive(Debug)]
@@ -179,57 +183,112 @@ impl ConnectionManager {
 
     pub async fn download(&mut self) {
         while let Some(msg) = self.rx.recv().await {
-            match msg {
-                ManagerMessage::PiecesAvailable(peer_ip, pieces) => {
-                    let conn = self.connections.get_mut(&peer_ip).unwrap();
+            if self.handle_message(msg) {
+                break;
+            }
+        }
+    }
 
-                    conn.available_pieces.extend(&pieces);
+    fn handle_message(&mut self, message: ManagerMessage) -> bool {
+        match message {
+            ManagerMessage::ChokeState(peer_ip, choked) => {
+                if let Some(conn) = self.connections.get_mut(&peer_ip) {
+                    conn.choked = choked;
+                }
 
-                    for piece in pieces {
-                        self.piece_availability.increment_piece(piece as usize);
+                self.publish_peers();
+
+                false
+            }
+            ManagerMessage::PiecesAvailable(peer_ip, pieces) => {
+                let conn = self.connections.get_mut(&peer_ip).unwrap();
+
+                // A `Have` only nudges the piece count by one, and arrives once per
+                // piece per peer. Only the first announcement adds a table row.
+                let joined_the_swarm = conn.available_pieces.is_empty();
+
+                conn.available_pieces.extend(&pieces);
+
+                for piece in pieces {
+                    self.piece_availability.increment_piece(piece as usize);
+                }
+
+                self.requrest_next_piece();
+
+                if joined_the_swarm {
+                    self.publish_peers();
+                }
+
+                false
+            }
+            ManagerMessage::PieceRecieved(from, index, piece) => {
+                let conn = self.connections.get_mut(&from).unwrap();
+                conn.is_downloading = false;
+                conn.current_piece = None;
+
+                if self.bitfield.check_piece(index) {
+                    self.publish_peers();
+
+                    return false;
+                }
+
+                let (_, hex_hash) = sha1(&piece);
+
+                if self.piece_hashes[index as usize] != hex_hash {
+                    tracing::info!(
+                        "Piece Hash Validation Failed -> {}: {} != {}, discarding and re-requesting",
+                        index,
+                        self.piece_hashes[index as usize],
+                        hex_hash
+                    );
+
+                    let _ = self.progress_tx.send(ProgressEvent::HashMismatch { index });
+
+                    self.requested_pieces.remove(&index);
+                    self.requrest_next_piece();
+                    self.publish_peers();
+
+                    return false;
+                }
+
+                if self.serializer.save_piece(index as u64, piece).is_ok() {
+                    self.bitfield.set_downloaded(index as usize);
+                    self.requested_pieces.remove(&index);
+                    self.piece_availability.increment_download_count();
+                    self.finalize_piece(index, &from);
+
+                    let _ = self.progress_tx.send(ProgressEvent::PieceDownloaded);
+
+                    if self.bitfield.is_completed() {
+                        let _ = self.progress_tx.send(ProgressEvent::Completed);
+
+                        return true;
                     }
 
                     self.requrest_next_piece();
                 }
-                ManagerMessage::PieceRecieved(from, index, piece) => {
-                    let conn = self.connections.get_mut(&from).unwrap();
-                    conn.is_downloading = false;
 
-                    if self.bitfield.check_piece(index) {
-                        continue;
-                    }
+                self.publish_peers();
 
-                    let (_, hex_hash) = sha1(&piece);
-
-                    if self.piece_hashes[index as usize] != hex_hash {
-                        tracing::info!(
-                            "Piece Hash Validation Failed -> {}: {} != {}, discarding and re-requesting",
-                            index,
-                            self.piece_hashes[index as usize],
-                            hex_hash
-                        );
-
-                        self.requested_pieces.remove(&index);
-                        self.requrest_next_piece();
-                    } else if let Ok(_) = self.serializer.save_piece(index as u64, piece) {
-                        self.bitfield.set_downloaded(index as usize);
-                        self.requested_pieces.remove(&index);
-                        self.piece_availability.increment_download_count();
-                        self.finalize_piece(index, &from);
-
-                        let _ = self.progress_tx.send(ProgressEvent::PieceDownloaded);
-
-                        if self.bitfield.is_completed() {
-                            print!("File download completed!");
-                            let _ = self.progress_tx.send(ProgressEvent::Completed);
-                            break;
-                        }
-
-                        self.requrest_next_piece();
-                    }
-                }
+                false
             }
         }
+    }
+
+    fn publish_peers(&self) {
+        let peers = self
+            .connections
+            .values()
+            .filter(|conn| !conn.tx.is_closed())
+            .map(|conn| PeerRow {
+                ip: conn.peer_ip.clone(),
+                available_pieces: conn.available_pieces.len(),
+                in_flight: conn.current_piece,
+                choked: conn.choked,
+            })
+            .collect();
+
+        let _ = self.progress_tx.send(ProgressEvent::Peers(peers));
     }
 
     fn requrest_next_piece(&mut self) {
@@ -241,13 +300,16 @@ impl ConnectionManager {
         let index = self.piece_availability.get_next_piece_index(&self.bitfield) as u32;
 
         let handle = self.connections.values_mut().find(|conn_handle| {
-            !conn_handle.is_downloading && conn_handle.available_pieces.contains(&index)
+            !conn_handle.is_downloading
+                && !conn_handle.tx.is_closed()
+                && conn_handle.available_pieces.contains(&index)
         });
 
         match handle {
             Some(conn) => {
                 let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(index));
                 conn.is_downloading = true;
+                conn.current_piece = Some(index);
 
                 self.requested_pieces.insert(index);
                 self.piece_owners
@@ -265,6 +327,9 @@ impl ConnectionManager {
 
         if self.all_pieces_requested() {
             tracing::info!("Entering end game mode");
+
+            let _ = self.progress_tx.send(ProgressEvent::EndGame);
+
             self.end_game = true;
             self.broadcast_end_game_requests();
         }
@@ -287,7 +352,7 @@ impl ConnectionManager {
             let new_owners: Vec<String> = self
                 .connections
                 .values()
-                .filter(|conn| conn.available_pieces.contains(&index))
+                .filter(|conn| !conn.tx.is_closed() && conn.available_pieces.contains(&index))
                 .map(|conn| conn.peer_ip.clone())
                 .filter(|peer_ip| {
                     !self

@@ -48,6 +48,8 @@ impl DownloadTask {
 
             let _ = self.progress_tx.send(crate::tui::ProgressEvent::Started {
                 total_pieces: pieces.len(),
+                piece_length: torr.info.piece_length,
+                output_path: torr.info.name.clone(),
             });
 
             let (raw_info_hash, info_hash) = sha1(&torr.info_raw);

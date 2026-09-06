@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use protocol::download_task::DownloadTask;
 
 mod protocol;
@@ -18,9 +20,12 @@ async fn main() {
             .await;
     });
 
-    let mut terminal = ratatui::init_with_options(ratatui::TerminalOptions {
-        viewport: ratatui::Viewport::Inline(8),
-    });
-    let _ = tui::app::App::new(progress_rx).run(&mut terminal);
+    let mut terminal = ratatui::init();
+    let outcome = tui::app::App::new(progress_rx, Instant::now()).run(&mut terminal);
     ratatui::restore();
+
+    match outcome {
+        Ok(summary) => summary.lines().iter().for_each(|line| println!("{line}")),
+        Err(error) => eprintln!("{error}"),
+    }
 }

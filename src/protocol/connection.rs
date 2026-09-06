@@ -155,8 +155,8 @@ pub enum ConnectionMessage {
 pub struct ConnectionHandle {
     pub peer_ip: String,
     pub choked: bool,
-    pub not_interested: bool,
     pub is_downloading: bool,
+    pub current_piece: Option<u32>,
     pub available_pieces: Vec<u32>,
 
     pub tx: mpsc::Sender<ConnectionMessage>,
@@ -264,8 +264,8 @@ impl Connection {
         ConnectionHandle {
             peer_ip: self.peer.ip.clone(),
             choked: self.choked,
-            not_interested: self.not_interested,
             is_downloading: false,
+            current_piece: None,
             available_pieces: self.available_pieces.clone(),
 
             tx: self.conn_tx.clone(),
@@ -276,8 +276,12 @@ impl Connection {
         loop {
             tokio::select! {
                 result = Self::read_message(&mut self.stream) => {
-                    if let Ok(message) = result {
-                        match message {
+                    match result {
+                        Err(error) => {
+                            tracing::info!("Peer {} disconnected: {}", self.peer.ip, error);
+                            return;
+                        }
+                        Ok(message) => match message {
                             Messages::Have(piece_index) => {
                                 self.available_pieces.push(piece_index);
 
@@ -288,9 +292,19 @@ impl Connection {
                             }
                             Messages::Choke => {
                                 self.choked = true;
+
+                                let _ = self.tx.try_send(ManagerMessage::ChokeState(
+                                    self.peer.ip.clone(),
+                                    true,
+                                ));
                             }
                             Messages::Unchoke => {
                                 self.choked = false;
+
+                                let _ = self.tx.try_send(ManagerMessage::ChokeState(
+                                    self.peer.ip.clone(),
+                                    false,
+                                ));
                             }
                             Messages::Interested => {
                                 self.not_interested = false;
