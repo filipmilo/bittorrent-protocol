@@ -324,17 +324,21 @@ impl Connection {
                                 }
 
 
-                                let piece_progress = self.in_progress.get_mut(&index).unwrap();
-                                piece_progress.add_block(begin, piece);
+                                // NOTE: Asserting if the piece is in progress since a piece can
+                                // arrive during cancelation.
+                                if let Some(piece_progress) = self.in_progress.get_mut(&index) {
+                                    piece_progress.add_block(begin, piece);
 
-                                if piece_progress.is_finished() {
-                                    let _ = self.tx.try_send(ManagerMessage::PieceRecieved(
-                                        self.peer.ip.clone(),
-                                        index,
-                                        piece_progress.piece.clone(),
-                                    ));
+                                    if piece_progress.is_finished() {
+                                        let _ = self.tx.try_send(ManagerMessage::PieceRecieved(
+                                            self.peer.ip.clone(),
+                                            index,
+                                            piece_progress.piece.clone(),
+                                        ));
 
-                                    tracing::info!("Piece {} downloaded", index);
+                                        self.in_progress.remove(&index);
+                                        tracing::info!("Piece {} downloaded", index);
+                                    }
                                 }
                             }
                             _ => {}

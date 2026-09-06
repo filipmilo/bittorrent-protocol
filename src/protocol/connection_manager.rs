@@ -195,6 +195,10 @@ impl ConnectionManager {
                     let conn = self.connections.get_mut(&from).unwrap();
                     conn.is_downloading = false;
 
+                    if self.bitfield.check_piece(index) {
+                        continue;
+                    }
+
                     let (_, hex_hash) = sha1(&piece);
 
                     if self.piece_hashes[index as usize] != hex_hash {
