@@ -12,3 +12,7 @@ pub const TARGET_LIVE_PEERS: usize = 50;
 pub const PEER_FLOOR: usize = 20;
 pub const MIN_ANNOUNCE_GAP: Duration = Duration::from_secs(60);
 pub const ROSTER_CAP: usize = 2 * NUMBER_OF_WANTED_PEERS;
+
+// BEP 3 puts the peer inactivity timeout at two minutes; sending at half of
+// that leaves room for one keep-alive to be lost or delayed.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
