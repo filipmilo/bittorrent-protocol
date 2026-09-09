@@ -7,7 +7,7 @@ use crate::{protocol::piece_selection::PieceSelection, tui::ProgressEvent};
 
 use super::{
     connection::{Connection, ConnectionHandle, ConnectionMessage},
-    constants::{MIN_ANNOUNCE_GAP, PEER_FLOOR, TARGET_LIVE_PEERS},
+    constants::{MIN_ANNOUNCE_GAP, PEER_FLOOR, ROSTER_CAP, TARGET_LIVE_PEERS},
     file_serializer::FileSerializer,
     peer_roster::{Lifecycle, Roster},
     tracker::{Peer, TrackerRequest, TrackerResponse},
@@ -284,6 +284,8 @@ impl ConnectionManager {
             ManagerMessage::PeersDiscovered(peers) => {
                 let shortfall = TARGET_LIVE_PEERS.saturating_sub(self.live_peers());
                 let fresh = self.roster.absorb(&peers, shortfall);
+
+                self.roster.prune(ROSTER_CAP);
 
                 let _ = self
                     .progress_tx

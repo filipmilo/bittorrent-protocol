@@ -11,3 +11,4 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TARGET_LIVE_PEERS: usize = 50;
 pub const PEER_FLOOR: usize = 20;
 pub const MIN_ANNOUNCE_GAP: Duration = Duration::from_secs(60);
+pub const ROSTER_CAP: usize = 2 * NUMBER_OF_WANTED_PEERS;

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::tui::{PeerPhase, PeerRow};
 
@@ -15,6 +15,7 @@ pub enum Lifecycle {
 #[derive(Debug)]
 pub struct Roster {
     peers: Vec<(String, Lifecycle)>,
+    retired: HashSet<String>,
 }
 
 impl Roster {
@@ -24,6 +25,7 @@ impl Roster {
                 .iter()
                 .map(|peer| (peer.address(), Lifecycle::Connecting))
                 .collect(),
+            retired: HashSet::new(),
         }
     }
 
@@ -59,7 +61,22 @@ impl Roster {
     }
 
     fn knows(&self, address: &str) -> bool {
-        self.peers.iter().any(|(known, _)| known == address)
+        self.retired.contains(address) || self.peers.iter().any(|(known, _)| known == address)
+    }
+
+    pub fn prune(&mut self, cap: usize) {
+        let mut excess = self.peers.len().saturating_sub(cap);
+
+        self.peers.retain(|(address, lifecycle)| {
+            let expendable = excess > 0 && *lifecycle == Lifecycle::Failed;
+
+            if expendable {
+                excess -= 1;
+                self.retired.insert(address.clone());
+            }
+
+            !expendable
+        });
     }
 
     pub fn mark(&mut self, address: &str, lifecycle: Lifecycle) {
@@ -420,6 +437,73 @@ mod tests {
             phases(&roster.rows(&HashMap::new())),
             vec![PeerPhase::Failed]
         );
+    }
+
+    #[test]
+    fn pruning_drops_the_oldest_failed_rows_once_the_cap_is_passed() {
+        let mut roster = Roster::from(&peers(&[
+            "1.1.1.1:6881",
+            "2.2.2.2:6881",
+            "3.3.3.3:6881",
+            "4.4.4.4:6881",
+        ]));
+
+        ["1.1.1.1:6881", "2.2.2.2:6881", "3.3.3.3:6881"]
+            .iter()
+            .for_each(|address| roster.mark(address, Lifecycle::Failed));
+
+        roster.prune(2);
+
+        assert_eq!(
+            roster
+                .rows(&HashMap::new())
+                .iter()
+                .map(|row| row.ip.clone())
+                .collect::<Vec<_>>(),
+            vec!["4.4.4.4:6881", "3.3.3.3:6881"]
+        );
+    }
+
+    #[test]
+    fn pruning_sacrifices_only_failures_even_when_that_misses_the_cap() {
+        let mut roster = Roster::from(&peers(&["1.1.1.1:6881", "2.2.2.2:6881", "3.3.3.3:6881"]));
+
+        roster.mark("1.1.1.1:6881", Lifecycle::Live);
+        roster.mark("2.2.2.2:6881", Lifecycle::Handshaking);
+        roster.mark("3.3.3.3:6881", Lifecycle::Failed);
+
+        roster.prune(1);
+
+        let mut remaining = roster
+            .rows(&HashMap::new())
+            .iter()
+            .map(|row| row.ip.clone())
+            .collect::<Vec<_>>();
+        remaining.sort();
+
+        assert_eq!(remaining, vec!["1.1.1.1:6881", "2.2.2.2:6881"]);
+    }
+
+    #[test]
+    fn a_pruned_address_is_still_known_and_is_never_dialled_again() {
+        let mut roster = Roster::from(&peers(&["1.1.1.1:6881", "2.2.2.2:6881"]));
+
+        roster.mark("1.1.1.1:6881", Lifecycle::Failed);
+        roster.prune(1);
+
+        assert_eq!(roster.rows(&HashMap::new()).len(), 1);
+        assert!(roster.absorb(&peers(&["1.1.1.1:6881"]), 10).is_empty());
+        assert_eq!(roster.rows(&HashMap::new()).len(), 1);
+    }
+
+    #[test]
+    fn pruning_below_the_cap_changes_nothing() {
+        let mut roster = Roster::from(&peers(&["1.1.1.1:6881", "2.2.2.2:6881"]));
+        roster.mark("1.1.1.1:6881", Lifecycle::Failed);
+
+        roster.prune(10);
+
+        assert_eq!(roster.rows(&HashMap::new()).len(), 2);
     }
 
     #[test]
