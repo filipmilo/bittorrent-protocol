@@ -3,7 +3,7 @@ use super::{
     connection_manager::ConnectionManager,
     file_serializer::FileSerializer,
     torrent_file::{Info, TorrentFile},
-    tracker::{Peer, TrackerRequest, TrackerResponse},
+    tracker::{TrackerRequest, TrackerResponse},
     utils::sha1,
 };
 use nanoid::nanoid;
@@ -71,11 +71,7 @@ impl DownloadTask {
             if let Ok(resp) = response {
                 match resp {
                     TrackerResponse::Success(peer_info) => {
-                        let ip_v4_peers: Vec<Peer> = peer_info
-                            .peers
-                            .into_iter()
-                            .filter(|peer| !peer.ip.contains(":"))
-                            .collect();
+                        let ip_v4_peers = peer_info.ip_v4_peers();
 
                         let _ = self
                             .progress_tx
@@ -90,6 +86,7 @@ impl DownloadTask {
                             peer_id,
                             pieces,
                             peer_info.interval,
+                            tracker_request,
                             serializer.unwrap(),
                             self.progress_tx.clone(),
                         )

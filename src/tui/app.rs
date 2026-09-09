@@ -66,6 +66,10 @@ impl App {
                 ProgressEvent::TrackerPeers { count } => {
                     self.events.push(format!("Tracker returned {count} peers"));
                 }
+                ProgressEvent::PeersDiscovered { count } => {
+                    self.events
+                        .push(format!("Re-announced, {count} new peers"));
+                }
                 ProgressEvent::PieceDownloaded => {
                     self.downloaded += 1;
                     self.throughput.record(now, self.piece_length);

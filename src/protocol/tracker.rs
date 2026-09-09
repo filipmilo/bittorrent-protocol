@@ -71,6 +71,16 @@ pub struct PeerInfo {
     pub peers: Vec<Peer>,
 }
 
+impl PeerInfo {
+    pub fn ip_v4_peers(&self) -> Vec<Peer> {
+        self.peers
+            .iter()
+            .filter(|peer| !peer.ip.contains(":"))
+            .cloned()
+            .collect()
+    }
+}
+
 impl TryFrom<BencodedDictionary> for PeerInfo {
     type Error = String;
 

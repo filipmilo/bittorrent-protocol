@@ -61,6 +61,9 @@ pub enum ProgressEvent {
     TrackerPeers {
         count: usize,
     },
+    PeersDiscovered {
+        count: usize,
+    },
     PieceDownloaded,
     Peers(Vec<PeerRow>),
     HashMismatch {

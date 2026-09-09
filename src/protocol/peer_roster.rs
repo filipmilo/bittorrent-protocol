@@ -27,6 +27,41 @@ impl Roster {
         }
     }
 
+    pub fn absorb(&mut self, peers: &[Peer], limit: usize) -> Vec<Peer> {
+        let fresh = self
+            .unknown(peers)
+            .into_iter()
+            .take(limit)
+            .collect::<Vec<Peer>>();
+
+        self.peers.extend(
+            fresh
+                .iter()
+                .map(|peer| (peer.address(), Lifecycle::Connecting)),
+        );
+
+        fresh
+    }
+
+    fn unknown(&self, peers: &[Peer]) -> Vec<Peer> {
+        peers.iter().fold(Vec::new(), |mut fresh, peer| {
+            let address = peer.address();
+
+            let seen = self.knows(&address)
+                || fresh.iter().any(|held: &Peer| held.address() == address);
+
+            if !seen {
+                fresh.push(peer.clone());
+            }
+
+            fresh
+        })
+    }
+
+    fn knows(&self, address: &str) -> bool {
+        self.peers.iter().any(|(known, _)| known == address)
+    }
+
     pub fn mark(&mut self, address: &str, lifecycle: Lifecycle) {
         if let Some((_, current)) = self.peers.iter_mut().find(|(known, _)| known == address) {
             *current = lifecycle;
@@ -308,6 +343,82 @@ mod tests {
                 ("1.1.1.1:51413", PeerPhase::Downloading),
                 ("1.1.1.1:6881", PeerPhase::Connecting),
             ]
+        );
+    }
+
+    #[test]
+    fn absorbs_only_addresses_it_does_not_already_know() {
+        let mut roster = Roster::from(&peers(&["1.1.1.1:6881", "2.2.2.2:6881"]));
+
+        let fresh = roster.absorb(&peers(&["2.2.2.2:6881", "3.3.3.3:6881"]), 10);
+
+        assert_eq!(
+            fresh.iter().map(Peer::address).collect::<Vec<_>>(),
+            vec!["3.3.3.3:6881"]
+        );
+        assert_eq!(roster.rows(&HashMap::new()).len(), 3);
+    }
+
+    #[test]
+    fn the_same_address_twice_in_one_batch_is_absorbed_once() {
+        let mut roster = Roster::from(&peers(&["1.1.1.1:6881"]));
+
+        let fresh = roster.absorb(&peers(&["9.9.9.9:6881", "9.9.9.9:6881"]), 10);
+
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(roster.rows(&HashMap::new()).len(), 2);
+    }
+
+    #[test]
+    fn absorbing_stops_at_the_limit() {
+        let mut roster = Roster::from(&peers(&["1.1.1.1:6881"]));
+
+        let fresh = roster.absorb(&peers(&["2.2.2.2:6881", "3.3.3.3:6881", "4.4.4.4:6881"]), 2);
+
+        assert_eq!(
+            fresh.iter().map(Peer::address).collect::<Vec<_>>(),
+            vec!["2.2.2.2:6881", "3.3.3.3:6881"]
+        );
+        assert_eq!(roster.rows(&HashMap::new()).len(), 3);
+    }
+
+    #[test]
+    fn a_limit_of_zero_absorbs_nothing() {
+        let mut roster = Roster::from(&peers(&["1.1.1.1:6881"]));
+
+        assert!(roster.absorb(&peers(&["2.2.2.2:6881"]), 0).is_empty());
+        assert_eq!(roster.rows(&HashMap::new()).len(), 1);
+    }
+
+    #[test]
+    fn an_absorbed_peer_starts_out_connecting_and_keeps_the_existing_order() {
+        let mut roster = Roster::from(&peers(&["1.1.1.1:6881"]));
+        roster.mark("1.1.1.1:6881", Lifecycle::Failed);
+
+        roster.absorb(&peers(&["2.2.2.2:6881"]), 10);
+
+        let rows = roster.rows(&HashMap::new());
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.ip.as_str(), row.phase))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2.2.2.2:6881", PeerPhase::Connecting),
+                ("1.1.1.1:6881", PeerPhase::Failed),
+            ]
+        );
+    }
+
+    #[test]
+    fn absorbing_a_peer_that_already_failed_does_not_resurrect_it() {
+        let mut roster = Roster::from(&peers(&["1.1.1.1:6881"]));
+        roster.mark("1.1.1.1:6881", Lifecycle::Failed);
+
+        assert!(roster.absorb(&peers(&["1.1.1.1:6881"]), 10).is_empty());
+        assert_eq!(
+            phases(&roster.rows(&HashMap::new())),
+            vec![PeerPhase::Failed]
         );
     }
 
