@@ -32,6 +32,14 @@ impl PeerPhase {
     pub fn is_pending(&self) -> bool {
         matches!(self, Self::Handshaking | Self::Connecting)
     }
+
+    pub fn group(&self) -> u8 {
+        match (self.is_live(), self.is_pending()) {
+            (true, _) => 0,
+            (_, true) => 1,
+            _ => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

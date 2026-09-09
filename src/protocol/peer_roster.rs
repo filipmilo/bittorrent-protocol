@@ -40,7 +40,7 @@ impl Roster {
             .map(|(address, lifecycle)| Self::row(address, *lifecycle, live.get(address)))
             .collect::<Vec<PeerRow>>();
 
-        rows.sort_by_key(|row| row.phase);
+        rows.sort_by_key(|row| row.phase.group());
 
         rows
     }
@@ -181,8 +181,12 @@ mod tests {
         assert_eq!(rows[0].available_pieces, 1521);
     }
 
+    fn order(rows: &[PeerRow]) -> Vec<String> {
+        rows.iter().map(|row| row.ip.clone()).collect()
+    }
+
     #[test]
-    fn a_choked_peer_outranks_a_handshaking_one_but_not_an_idle_one() {
+    fn a_choked_peer_still_outranks_one_that_has_not_connected() {
         let mut roster = Roster::from(&peers(&["1.1.1.1:6881", "2.2.2.2:6881", "3.3.3.3:6881"]));
 
         roster.mark("1.1.1.1:6881", Lifecycle::Handshaking);
@@ -196,8 +200,51 @@ mod tests {
 
         assert_eq!(
             phases(&roster.rows(&connections)),
-            vec![PeerPhase::Idle, PeerPhase::Choked, PeerPhase::Handshaking]
+            vec![PeerPhase::Choked, PeerPhase::Idle, PeerPhase::Handshaking]
         );
+    }
+
+    #[test]
+    fn a_live_peer_holds_its_row_when_it_stops_downloading() {
+        let mut roster = Roster::from(&peers(&["1.1.1.1:6881", "2.2.2.2:6881", "3.3.3.3:6881"]));
+
+        ["1.1.1.1:6881", "2.2.2.2:6881", "3.3.3.3:6881"]
+            .iter()
+            .for_each(|address| roster.mark(address, Lifecycle::Live));
+
+        let while_downloading = live(vec![
+            handle("1.1.1.1:6881", false, None, 10),
+            handle("2.2.2.2:6881", false, Some(5), 10),
+            handle("3.3.3.3:6881", false, None, 10),
+        ]);
+
+        let once_idle = live(vec![
+            handle("1.1.1.1:6881", false, None, 10),
+            handle("2.2.2.2:6881", false, None, 10),
+            handle("3.3.3.3:6881", false, None, 10),
+        ]);
+
+        assert_eq!(
+            order(&roster.rows(&while_downloading)),
+            order(&roster.rows(&once_idle))
+        );
+    }
+
+    #[test]
+    fn a_peer_that_starts_downloading_does_not_jump_the_table() {
+        let mut roster = Roster::from(&peers(&["1.1.1.1:6881", "2.2.2.2:6881", "3.3.3.3:6881"]));
+
+        ["1.1.1.1:6881", "2.2.2.2:6881", "3.3.3.3:6881"]
+            .iter()
+            .for_each(|address| roster.mark(address, Lifecycle::Live));
+
+        let rows = roster.rows(&live(vec![
+            handle("1.1.1.1:6881", false, None, 10),
+            handle("2.2.2.2:6881", false, None, 10),
+            handle("3.3.3.3:6881", false, Some(9), 10),
+        ]));
+
+        assert_eq!(order(&rows), vec!["1.1.1.1:6881", "2.2.2.2:6881", "3.3.3.3:6881"]);
     }
 
     #[test]
