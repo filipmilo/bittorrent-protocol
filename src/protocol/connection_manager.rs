@@ -1,16 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use futures::future::join_all;
 use tokio::sync::mpsc;
 
-use crate::{
-    protocol::piece_selection::PieceSelection,
-    tui::{PeerRow, ProgressEvent},
-};
+use crate::{protocol::piece_selection::PieceSelection, tui::ProgressEvent};
 
 use super::{
     connection::{Connection, ConnectionHandle, ConnectionMessage},
     file_serializer::FileSerializer,
+    peer_roster::{Lifecycle, Roster},
     tracker::Peer,
     utils::sha1,
 };
@@ -79,6 +76,9 @@ impl Bitfield {
 }
 
 pub enum ManagerMessage {
+    Handshaking(String),
+    Connected(String, ConnectionHandle),
+    ConnectionFailed(String),
     PieceRecieved(String, u32, Vec<u8>),
     PiecesAvailable(String, Vec<u32>),
     ChokeState(String, bool),
@@ -91,6 +91,7 @@ pub struct ConnectionManager {
     tracker_interval: u64,
 
     connections: HashMap<String, ConnectionHandle>,
+    roster: Roster,
 
     rx: mpsc::Receiver<ManagerMessage>,
     tx: mpsc::Sender<ManagerMessage>,
@@ -106,7 +107,7 @@ pub struct ConnectionManager {
 }
 
 impl ConnectionManager {
-    pub async fn new(
+    pub fn new(
         piece_length: u64,
         peers: &[Peer],
         raw_info_hash: Vec<u8>,
@@ -118,62 +119,30 @@ impl ConnectionManager {
     ) -> Self {
         let (tx, rx) = mpsc::channel::<ManagerMessage>(100);
 
-        let connections = join_all(peers.iter().map(|peer| async {
-            let result = Connection::initialize(
-                piece_length as usize,
-                &raw_info_hash,
-                peer_id.as_bytes(),
-                peer.clone(),
-                tx.clone(),
-            )
-            .await;
-
-            if let Ok(conn) = result {
-                return Some(conn);
-            }
-
-            None
-        }))
-        .await
-        .into_iter()
-        .filter_map(|conn| conn)
-        .collect::<Vec<Connection>>();
-
-        tracing::info!(
-            "Connected Peers: {:#?}",
-            connections
-                .iter()
-                .map(|conn| conn.get_peer())
-                .collect::<Vec<Peer>>()
-        );
         tracing::info!("Tracker interval: {:#?}", tracker_interval);
 
-        let handles: HashMap<String, ConnectionHandle> = connections
-            .iter()
-            .map(|conn| {
-                let handle = conn.create_handle();
-
-                (handle.peer_ip.clone(), handle)
-            })
-            .collect();
-
-        for mut conn in connections {
-            tokio::spawn(async move { conn.serve().await });
-        }
-
-        let bitfield = Bitfield::new(piece_hashes.len());
+        peers.iter().for_each(|peer| {
+            tokio::spawn(Self::establish(
+                piece_length as usize,
+                raw_info_hash.clone(),
+                peer_id.clone(),
+                peer.clone(),
+                tx.clone(),
+            ));
+        });
 
         let piece_num = piece_hashes.len();
 
         ConnectionManager {
             rx,
             tx,
-            bitfield,
             piece_hashes,
             tracker_interval,
             serializer,
             progress_tx,
-            connections: handles,
+            bitfield: Bitfield::new(piece_num),
+            roster: Roster::from(peers),
+            connections: HashMap::new(),
             piece_availability: PieceSelection::from(piece_num),
             requested_pieces: HashSet::new(),
             piece_owners: HashMap::new(),
@@ -181,7 +150,42 @@ impl ConnectionManager {
         }
     }
 
+    async fn establish(
+        piece_length: usize,
+        raw_info_hash: Vec<u8>,
+        peer_id: String,
+        peer: Peer,
+        tx: mpsc::Sender<ManagerMessage>,
+    ) {
+        let address = peer.address();
+
+        match Connection::initialize(
+            piece_length,
+            &raw_info_hash,
+            peer_id.as_bytes(),
+            peer,
+            tx.clone(),
+        )
+        .await
+        {
+            Ok(mut conn) => {
+                let connected = ManagerMessage::Connected(address, conn.create_handle());
+
+                if tx.send(connected).await.is_ok() {
+                    conn.serve().await;
+                }
+            }
+            Err(error) => {
+                tracing::info!("Peer: {} -> Failure ({})", address, error);
+
+                let _ = tx.send(ManagerMessage::ConnectionFailed(address)).await;
+            }
+        }
+    }
+
     pub async fn download(&mut self) {
+        self.publish_peers();
+
         while let Some(msg) = self.rx.recv().await {
             if self.handle_message(msg) {
                 break;
@@ -191,6 +195,26 @@ impl ConnectionManager {
 
     fn handle_message(&mut self, message: ManagerMessage) -> bool {
         match message {
+            ManagerMessage::Handshaking(peer_ip) => {
+                self.roster.mark(&peer_ip, Lifecycle::Handshaking);
+                self.publish_peers();
+
+                false
+            }
+            ManagerMessage::Connected(peer_ip, handle) => {
+                self.roster.mark(&peer_ip, Lifecycle::Live);
+                self.connections.insert(peer_ip, handle);
+                self.publish_peers();
+
+                false
+            }
+            ManagerMessage::ConnectionFailed(peer_ip) => {
+                self.roster.mark(&peer_ip, Lifecycle::Failed);
+                self.connections.remove(&peer_ip);
+                self.publish_peers();
+
+                false
+            }
             ManagerMessage::ChokeState(peer_ip, choked) => {
                 if let Some(conn) = self.connections.get_mut(&peer_ip) {
                     conn.choked = choked;
@@ -201,7 +225,9 @@ impl ConnectionManager {
                 false
             }
             ManagerMessage::PiecesAvailable(peer_ip, pieces) => {
-                let conn = self.connections.get_mut(&peer_ip).unwrap();
+                let Some(conn) = self.connections.get_mut(&peer_ip) else {
+                    return false;
+                };
 
                 // A `Have` only nudges the piece count by one, and arrives once per
                 // piece per peer. Only the first announcement adds a table row.
@@ -222,7 +248,10 @@ impl ConnectionManager {
                 false
             }
             ManagerMessage::PieceRecieved(from, index, piece) => {
-                let conn = self.connections.get_mut(&from).unwrap();
+                let Some(conn) = self.connections.get_mut(&from) else {
+                    return false;
+                };
+
                 conn.is_downloading = false;
                 conn.current_piece = None;
 
@@ -276,19 +305,9 @@ impl ConnectionManager {
     }
 
     fn publish_peers(&self) {
-        let peers = self
-            .connections
-            .values()
-            .filter(|conn| !conn.tx.is_closed())
-            .map(|conn| PeerRow {
-                ip: conn.peer_ip.clone(),
-                available_pieces: conn.available_pieces.len(),
-                in_flight: conn.current_piece,
-                choked: conn.choked,
-            })
-            .collect();
-
-        let _ = self.progress_tx.send(ProgressEvent::Peers(peers));
+        let _ = self
+            .progress_tx
+            .send(ProgressEvent::Peers(self.roster.rows(&self.connections)));
     }
 
     fn requrest_next_piece(&mut self) {
@@ -315,7 +334,7 @@ impl ConnectionManager {
                 self.piece_owners
                     .entry(index)
                     .or_default()
-                    .insert(conn.peer_ip.clone());
+                    .insert(conn.address.clone());
             }
             None => {
                 tracing::info!(
@@ -353,21 +372,21 @@ impl ConnectionManager {
                 .connections
                 .values()
                 .filter(|conn| !conn.tx.is_closed() && conn.available_pieces.contains(&index))
-                .map(|conn| conn.peer_ip.clone())
-                .filter(|peer_ip| {
+                .map(|conn| conn.address.clone())
+                .filter(|address| {
                     !self
                         .piece_owners
                         .get(&index)
-                        .is_some_and(|owners| owners.contains(peer_ip))
+                        .is_some_and(|owners| owners.contains(address))
                 })
                 .collect();
 
-            for peer_ip in new_owners {
-                if let Some(conn) = self.connections.get(&peer_ip) {
+            for address in new_owners {
+                if let Some(conn) = self.connections.get(&address) {
                     let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(index));
                 }
 
-                self.piece_owners.entry(index).or_default().insert(peer_ip);
+                self.piece_owners.entry(index).or_default().insert(address);
             }
         }
     }
@@ -376,12 +395,12 @@ impl ConnectionManager {
     // end game, now that one copy has already been received and verified.
     fn finalize_piece(&mut self, index: u32, downloaded_from: &str) {
         if let Some(owners) = self.piece_owners.remove(&index) {
-            for peer_ip in owners {
-                if peer_ip == downloaded_from {
+            for address in owners {
+                if address == downloaded_from {
                     continue;
                 }
 
-                if let Some(conn) = self.connections.get(&peer_ip) {
+                if let Some(conn) = self.connections.get(&address) {
                     let _ = conn.tx.try_send(ConnectionMessage::Cancel(index));
                 }
             }

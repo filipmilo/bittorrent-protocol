@@ -64,6 +64,8 @@ impl DownloadTask {
                 torr.info.length.unwrap(),
             );
 
+            let _ = self.progress_tx.send(crate::tui::ProgressEvent::TrackerQuery);
+
             let response = tracker_request.fetch_peer_info().await;
 
             if let Ok(resp) = response {
@@ -75,6 +77,12 @@ impl DownloadTask {
                             .filter(|peer| !peer.ip.contains(":"))
                             .collect();
 
+                        let _ = self
+                            .progress_tx
+                            .send(crate::tui::ProgressEvent::TrackerPeers {
+                                count: ip_v4_peers.len(),
+                            });
+
                         ConnectionManager::new(
                             torr.info.piece_length,
                             &ip_v4_peers,
@@ -85,7 +93,6 @@ impl DownloadTask {
                             serializer.unwrap(),
                             self.progress_tx.clone(),
                         )
-                        .await
                         .download()
                         .await;
                     }

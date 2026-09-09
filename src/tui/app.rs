@@ -13,7 +13,7 @@ use ratatui::{Frame, Terminal};
 use super::event_log::EventLog;
 use super::stats::{Throughput, format_bytes, format_duration, format_rate};
 use super::summary::{ExitReason, Summary};
-use super::{PeerRow, ProgressEvent};
+use super::{PeerPhase, PeerRow, ProgressEvent};
 
 const RATE_WINDOW: Duration = Duration::from_secs(5);
 const EVENT_LOG_CAPACITY: usize = 64;
@@ -59,6 +59,12 @@ impl App {
                     self.total_pieces = total_pieces;
                     self.piece_length = piece_length;
                     self.output_path = output_path;
+                }
+                ProgressEvent::TrackerQuery => {
+                    self.events.push("Contacting tracker".to_string());
+                }
+                ProgressEvent::TrackerPeers { count } => {
+                    self.events.push(format!("Tracker returned {count} peers"));
                 }
                 ProgressEvent::PieceDownloaded => {
                     self.downloaded += 1;
@@ -157,8 +163,12 @@ fn piece_gauge(app: &App) -> LineGauge<'_> {
 }
 
 fn transfer_stats(app: &App, now: Instant) -> Paragraph<'_> {
-    let live_peers = app.peers.len();
-    let unchoked = app.peers.iter().filter(|peer| !peer.choked).count();
+    let live_peers = app.peers.iter().filter(|peer| peer.phase.is_live()).count();
+    let unchoked = app
+        .peers
+        .iter()
+        .filter(|peer| peer.phase.is_live() && peer.phase != PeerPhase::Choked)
+        .count();
 
     Paragraph::new(Line::from(vec![
         Span::styled(
@@ -184,29 +194,36 @@ fn transfer_stats(app: &App, now: Instant) -> Paragraph<'_> {
     ]))
 }
 
+fn phase_style(phase: PeerPhase) -> Style {
+    match phase {
+        PeerPhase::Downloading => Style::default().fg(Color::Green),
+        PeerPhase::Idle => Style::default().fg(Color::DarkGray),
+        PeerPhase::Choked => Style::default().fg(Color::Red),
+        PeerPhase::Handshaking => Style::default().fg(Color::Yellow),
+        PeerPhase::Connecting => Style::default().fg(Color::Blue),
+        PeerPhase::Failed => Style::default().dim(),
+    }
+}
+
 fn peer_table(app: &App) -> Table<'_> {
     let rows = app.peers.iter().map(|peer| {
-        let (state, style) = match (peer.choked, peer.in_flight) {
-            (true, _) => ("choked", Style::default().fg(Color::Red)),
-            (false, Some(_)) => ("downloading", Style::default().fg(Color::Green)),
-            (false, None) => ("idle", Style::default().fg(Color::DarkGray)),
-        };
+        let dash = || "-".to_string();
 
         Row::new(vec![
             Cell::from(peer.ip.clone()),
-            Cell::from(state).style(style),
-            Cell::from(
-                peer.in_flight
-                    .map_or_else(|| "-".to_string(), |index| index.to_string()),
-            ),
-            Cell::from(peer.available_pieces.to_string()),
+            Cell::from(peer.phase.label()).style(phase_style(peer.phase)),
+            Cell::from(peer.in_flight.map_or_else(dash, |index| index.to_string())),
+            Cell::from(match peer.phase.is_live() {
+                true => peer.available_pieces.to_string(),
+                false => dash(),
+            }),
         ])
     });
 
     Table::new(
         rows,
         [
-            Constraint::Length(21),
+            Constraint::Length(23),
             Constraint::Length(13),
             Constraint::Length(10),
             Constraint::Min(5),
@@ -221,10 +238,27 @@ fn peer_table(app: &App) -> Table<'_> {
     )
     .block(
         Block::default()
-            .title(Line::from(
+            .title(Line::from(vec![
                 format!("Connections ({})", app.peers.len()).bold(),
-            ))
+                Span::styled(connection_tally(app), Style::default().dim()),
+            ]))
             .padding(Padding::left(1)),
+    )
+}
+
+fn connection_tally(app: &App) -> String {
+    let count = |predicate: fn(&PeerPhase) -> bool| {
+        app.peers
+            .iter()
+            .filter(|peer| predicate(&peer.phase))
+            .count()
+    };
+
+    format!(
+        "   {} live · {} pending · {} failed",
+        count(PeerPhase::is_live),
+        count(PeerPhase::is_pending),
+        count(|phase| *phase == PeerPhase::Failed),
     )
 }
 
@@ -328,9 +362,9 @@ mod tests {
     fn replaces_the_peer_table_with_the_latest_snapshot() {
         let peer = PeerRow {
             ip: "10.0.0.1".to_string(),
+            phase: PeerPhase::Downloading,
             available_pieces: 12,
             in_flight: Some(7),
-            choked: false,
         };
         let (mut app, _tx, start) =
             app_with_events(vec![started(), ProgressEvent::Peers(vec![peer.clone()])]);
@@ -382,15 +416,15 @@ mod tests {
         let peers = vec![
             PeerRow {
                 ip: "10.0.0.1".to_string(),
+                phase: PeerPhase::Downloading,
                 available_pieces: 12,
                 in_flight: Some(7),
-                choked: false,
             },
             PeerRow {
                 ip: "10.0.0.2".to_string(),
+                phase: PeerPhase::Choked,
                 available_pieces: 90,
                 in_flight: None,
-                choked: true,
             },
         ];
         let (mut app, _tx, start) = app_with_events(vec![
@@ -453,6 +487,115 @@ mod tests {
         let text = rendered_text(&app, now, 100, 30);
 
         assert!(text.contains("Connections (2)"), "{text}");
+    }
+
+    fn peer(ip: &str, phase: PeerPhase) -> PeerRow {
+        PeerRow {
+            ip: ip.to_string(),
+            phase,
+            available_pieces: 0,
+            in_flight: None,
+        }
+    }
+
+    fn app_showing(peers: Vec<PeerRow>) -> (App, Instant) {
+        let (mut app, _tx, start) =
+            app_with_events(vec![started(), ProgressEvent::Peers(peers)]);
+
+        app.apply_pending_events(start);
+
+        (app, start)
+    }
+
+    #[test]
+    fn draws_peers_that_have_not_finished_connecting_yet() {
+        let (app, now) = app_showing(vec![
+            peer("10.0.0.1", PeerPhase::Connecting),
+            peer("10.0.0.2", PeerPhase::Handshaking),
+        ]);
+
+        let text = rendered_text(&app, now, 100, 30);
+
+        assert!(text.contains("10.0.0.1"), "{text}");
+        assert!(text.contains("connecting"), "{text}");
+        assert!(text.contains("handshaking"), "{text}");
+    }
+
+    #[test]
+    fn draws_peers_that_failed_to_connect() {
+        let (app, now) = app_showing(vec![peer("10.0.0.9", PeerPhase::Failed)]);
+
+        let text = rendered_text(&app, now, 100, 30);
+
+        assert!(text.contains("10.0.0.9"), "{text}");
+        assert!(text.contains("failed"), "{text}");
+    }
+
+    #[test]
+    fn tallies_live_pending_and_failed_peers_separately() {
+        let (app, now) = app_showing(vec![
+            peer("10.0.0.1", PeerPhase::Downloading),
+            peer("10.0.0.2", PeerPhase::Idle),
+            peer("10.0.0.3", PeerPhase::Connecting),
+            peer("10.0.0.4", PeerPhase::Handshaking),
+            peer("10.0.0.5", PeerPhase::Connecting),
+            peer("10.0.0.6", PeerPhase::Failed),
+        ]);
+
+        let text = rendered_text(&app, now, 100, 30);
+
+        assert!(text.contains("2 live"), "{text}");
+        assert!(text.contains("3 pending"), "{text}");
+        assert!(text.contains("1 failed"), "{text}");
+    }
+
+    #[test]
+    fn counts_only_live_peers_in_the_transfer_line() {
+        let (app, now) = app_showing(vec![
+            peer("10.0.0.1", PeerPhase::Downloading),
+            peer("10.0.0.2", PeerPhase::Choked),
+            peer("10.0.0.3", PeerPhase::Connecting),
+            peer("10.0.0.4", PeerPhase::Failed),
+        ]);
+
+        let text = rendered_text(&app, now, 100, 30);
+
+        assert!(text.contains("2 peers"), "{text}");
+        assert!(text.contains("(1 unchoked)"), "{text}");
+    }
+
+    #[test]
+    fn a_pending_peer_shows_no_piece_count() {
+        let (app, now) = app_showing(vec![PeerRow {
+            ip: "10.0.0.1".to_string(),
+            phase: PeerPhase::Connecting,
+            available_pieces: 0,
+            in_flight: None,
+        }]);
+
+        let text = rendered_text(&app, now, 100, 30);
+        let row = text
+            .lines()
+            .find(|line| line.contains("10.0.0.1"))
+            .expect("peer row");
+
+        assert!(row.contains('-'), "{row}");
+    }
+
+    #[test]
+    fn logs_the_tracker_handshake_before_any_peer_is_known() {
+        let (mut app, _tx, start) = app_with_events(vec![
+            started(),
+            ProgressEvent::TrackerQuery,
+            ProgressEvent::TrackerPeers { count: 47 },
+        ]);
+
+        app.apply_pending_events(start);
+
+        let log = app.events.entries().collect::<Vec<_>>().join("\n");
+
+        assert!(log.contains("tracker"), "{log}");
+        assert!(log.contains("47 peers"), "{log}");
     }
 
     #[test]

@@ -27,6 +27,12 @@ pub struct Peer {
     pub port: u16,
 }
 
+impl Peer {
+    pub fn address(&self) -> String {
+        format!("{}:{}", self.ip, self.port)
+    }
+}
+
 impl TryFrom<BencodedDictionary> for Peer {
     type Error = String;
 

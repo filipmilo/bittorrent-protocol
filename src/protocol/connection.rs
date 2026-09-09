@@ -8,9 +8,29 @@ use tokio::{
 
 use super::{
     connection_manager::{Bitfield, ManagerMessage},
-    constants::{HANDSHAKE_MESSAGE, MAX_OUTBOUND_REQUESTS, REQUEST_BLOCK_SIZE},
+    constants::{
+        CONNECT_TIMEOUT, HANDSHAKE_MESSAGE, HANDSHAKE_TIMEOUT, MAX_OUTBOUND_REQUESTS,
+        REQUEST_BLOCK_SIZE,
+    },
     tracker::Peer,
 };
+
+const HANDSHAKE_LENGTH: usize = 68;
+
+async fn timed_out<T>(
+    limit: std::time::Duration,
+    operation: impl Future<Output = std::io::Result<T>>,
+    stage: &'static str,
+) -> std::io::Result<T> {
+    tokio::time::timeout(limit, operation)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{stage} timed out"),
+            ))
+        })
+}
 
 #[derive(Debug, Clone)]
 enum Messages {
@@ -153,7 +173,7 @@ pub enum ConnectionMessage {
 
 #[derive(Debug)]
 pub struct ConnectionHandle {
-    pub peer_ip: String,
+    pub address: String,
     pub choked: bool,
     pub is_downloading: bool,
     pub current_piece: Option<u32>,
@@ -224,22 +244,38 @@ impl Connection {
         peer: Peer,
         tx: mpsc::Sender<ManagerMessage>,
     ) -> std::io::Result<Self> {
-        let mut stream = TcpStream::connect(format!("{}:{}", peer.ip, peer.port)).await?;
+        let mut stream = timed_out(
+            CONNECT_TIMEOUT,
+            TcpStream::connect(peer.address()),
+            "connect",
+        )
+        .await?;
+
+        let _ = tx
+            .send(ManagerMessage::Handshaking(peer.address()))
+            .await;
 
         let handshake = Self::construct_handshake(raw_info_hash, raw_peer_id);
-        let mut data = vec![0; 68];
+        let mut data = vec![0; HANDSHAKE_LENGTH];
 
-        stream.write(&handshake).await?;
+        timed_out(
+            HANDSHAKE_TIMEOUT,
+            async {
+                stream.write_all(&handshake).await?;
+                stream.read_exact(&mut data).await
+            },
+            "handshake",
+        )
+        .await?;
 
-        stream.read(&mut data).await?;
+        if data[28..48] != handshake[28..48] {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "info hash mismatch",
+            ));
+        }
 
-        let success_message = if data[28..48] == handshake[28..48] {
-            "-> Success"
-        } else {
-            "-> Failure"
-        };
-
-        tracing::info!("Peer: {} {}", peer.ip, success_message);
+        tracing::info!("Peer: {} -> Success", peer.address());
 
         let (conn_tx, rx) = mpsc::channel::<ConnectionMessage>(100);
 
@@ -262,7 +298,7 @@ impl Connection {
 
     pub fn create_handle(&self) -> ConnectionHandle {
         ConnectionHandle {
-            peer_ip: self.peer.ip.clone(),
+            address: self.peer.address(),
             choked: self.choked,
             is_downloading: false,
             current_piece: None,
@@ -278,7 +314,7 @@ impl Connection {
                 result = Self::read_message(&mut self.stream) => {
                     match result {
                         Err(error) => {
-                            tracing::info!("Peer {} disconnected: {}", self.peer.ip, error);
+                            tracing::info!("Peer {} disconnected: {}", self.peer.address(), error);
                             return;
                         }
                         Ok(message) => match message {
@@ -286,7 +322,7 @@ impl Connection {
                                 self.available_pieces.push(piece_index);
 
                                 let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
-                                    self.peer.ip.clone(),
+                                    self.peer.address(),
                                     vec![piece_index],
                                 ));
                             }
@@ -294,7 +330,7 @@ impl Connection {
                                 self.choked = true;
 
                                 let _ = self.tx.try_send(ManagerMessage::ChokeState(
-                                    self.peer.ip.clone(),
+                                    self.peer.address(),
                                     true,
                                 ));
                             }
@@ -302,7 +338,7 @@ impl Connection {
                                 self.choked = false;
 
                                 let _ = self.tx.try_send(ManagerMessage::ChokeState(
-                                    self.peer.ip.clone(),
+                                    self.peer.address(),
                                     false,
                                 ));
                             }
@@ -318,7 +354,7 @@ impl Connection {
                                 self.available_pieces.extend(&piece_indexes);
 
                                 let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
-                                    self.peer.ip.clone(),
+                                    self.peer.address(),
                                     piece_indexes,
                                 ));
                             }
@@ -345,7 +381,7 @@ impl Connection {
 
                                     if piece_progress.is_finished() {
                                         let _ = self.tx.try_send(ManagerMessage::PieceRecieved(
-                                            self.peer.ip.clone(),
+                                            self.peer.address(),
                                             index,
                                             piece_progress.piece.clone(),
                                         ));
@@ -421,10 +457,6 @@ impl Connection {
 
             }
         }
-    }
-
-    pub fn get_peer(&self) -> Peer {
-        self.peer.clone()
     }
 
     async fn read_message(stream: &mut TcpStream) -> std::io::Result<Messages> {
