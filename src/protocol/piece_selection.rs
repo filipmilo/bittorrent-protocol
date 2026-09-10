@@ -23,6 +23,10 @@ impl PieceSelection {
         self.piece_availability[index] += 1;
     }
 
+    pub fn decrement_piece(&mut self, index: usize) {
+        self.piece_availability[index] = self.piece_availability[index].saturating_sub(1);
+    }
+
     pub fn increment_download_count(&mut self) {
         self.downloaded_count += 1;
     }
@@ -176,6 +180,38 @@ mod tests {
             .collect::<HashSet<u32>>();
 
         assert_eq!(picked, offered(&[0, 1, 2]));
+    }
+
+    // Announcements that are never taken back leave rarest-first ranking
+    // pieces by how early they were first seen rather than by how rare they are.
+    #[test]
+    fn a_departed_peers_announcements_stop_counting_towards_rarity() {
+        let mut selection = swarm(&[0, 0]);
+        let holder = offered(&[0, 1]);
+
+        (0..3).for_each(|_| selection.increment_piece(0));
+        (0..2).for_each(|_| selection.increment_piece(1));
+
+        assert_eq!(
+            selection.select(&holder, &nothing_downloaded(2), &HashSet::new()),
+            Some(1)
+        );
+
+        (0..2).for_each(|_| selection.decrement_piece(0));
+
+        assert_eq!(
+            selection.select(&holder, &nothing_downloaded(2), &HashSet::new()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn availability_never_falls_below_nobody() {
+        let mut selection = swarm(&[0]);
+
+        selection.decrement_piece(0);
+
+        assert_eq!(selection.availability(0), 0);
     }
 
     #[test]

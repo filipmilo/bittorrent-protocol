@@ -115,6 +115,7 @@ pub enum ManagerMessage {
     Handshaking(String),
     Connected(String, ConnectionHandle),
     ConnectionFailed(String),
+    Disconnected(String),
     PieceRecieved(String, u32, Vec<u8>),
     PiecesAvailable(String, Vec<u32>),
     ChokeState(String, bool),
@@ -306,8 +307,14 @@ impl ConnectionManager {
                 false
             }
             ManagerMessage::ConnectionFailed(peer_ip) => {
-                self.roster.mark(&peer_ip, Lifecycle::Failed);
-                self.connections.remove(&peer_ip);
+                self.release_peer(&peer_ip);
+                self.publish_peers();
+
+                false
+            }
+            ManagerMessage::Disconnected(peer_ip) => {
+                self.release_peer(&peer_ip);
+                self.fill_request_slots();
                 self.publish_peers();
 
                 false
@@ -441,6 +448,41 @@ impl ConnectionManager {
 
             self.end_game = true;
             self.broadcast_end_game_requests();
+        }
+    }
+
+    // A peer that leaves takes its announcements with it. Without giving the
+    // counts back, availability only ever climbs and rarest-first decays into
+    // "whichever piece was announced least early".
+    fn release_peer(&mut self, address: &str) {
+        self.roster.mark(address, Lifecycle::Failed);
+
+        let Some(conn) = self.connections.remove(address) else {
+            return;
+        };
+
+        for piece in &conn.available_pieces {
+            self.piece_availability.decrement_piece(*piece as usize);
+        }
+
+        if let Some(index) = conn.current_piece {
+            self.abandon_request(index, address);
+        }
+    }
+
+    // Whatever this peer was fetching is not coming. Unless someone else was
+    // asked for it too, it goes back on the wanted list to be reassigned.
+    fn abandon_request(&mut self, index: u32, address: &str) {
+        let Some(owners) = self.piece_owners.get_mut(&index) else {
+            self.requested_pieces.remove(&index);
+            return;
+        };
+
+        owners.remove(address);
+
+        if owners.is_empty() {
+            self.piece_owners.remove(&index);
+            self.requested_pieces.remove(&index);
         }
     }
 

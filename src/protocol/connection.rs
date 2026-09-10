@@ -328,6 +328,12 @@ impl Connection {
                     match result {
                         Err(error) => {
                             tracing::info!("Peer {} disconnected: {}", self.peer.address(), error);
+
+                            let _ = self
+                                .tx
+                                .send(ManagerMessage::Disconnected(self.peer.address()))
+                                .await;
+
                             return;
                         }
                         Ok(message) => match message {
