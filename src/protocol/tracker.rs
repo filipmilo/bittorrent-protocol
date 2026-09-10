@@ -27,6 +27,12 @@ pub struct Peer {
     pub port: u16,
 }
 
+impl Peer {
+    pub fn address(&self) -> String {
+        format!("{}:{}", self.ip, self.port)
+    }
+}
+
 impl TryFrom<BencodedDictionary> for Peer {
     type Error = String;
 
@@ -63,6 +69,16 @@ impl TryFrom<&[u8]> for Peer {
 pub struct PeerInfo {
     pub interval: u64,
     pub peers: Vec<Peer>,
+}
+
+impl PeerInfo {
+    pub fn ip_v4_peers(&self) -> Vec<Peer> {
+        self.peers
+            .iter()
+            .filter(|peer| !peer.ip.contains(":"))
+            .cloned()
+            .collect()
+    }
 }
 
 impl TryFrom<BencodedDictionary> for PeerInfo {

@@ -3,7 +3,7 @@ use super::{
     connection_manager::ConnectionManager,
     file_serializer::FileSerializer,
     torrent_file::{Info, TorrentFile},
-    tracker::{Peer, TrackerRequest, TrackerResponse},
+    tracker::{TrackerRequest, TrackerResponse},
     utils::sha1,
 };
 use nanoid::nanoid;
@@ -48,6 +48,8 @@ impl DownloadTask {
 
             let _ = self.progress_tx.send(crate::tui::ProgressEvent::Started {
                 total_pieces: pieces.len(),
+                piece_length: torr.info.piece_length,
+                output_path: torr.info.name.clone(),
             });
 
             let (raw_info_hash, info_hash) = sha1(&torr.info_raw);
@@ -62,16 +64,20 @@ impl DownloadTask {
                 torr.info.length.unwrap(),
             );
 
+            let _ = self.progress_tx.send(crate::tui::ProgressEvent::TrackerQuery);
+
             let response = tracker_request.fetch_peer_info().await;
 
             if let Ok(resp) = response {
                 match resp {
                     TrackerResponse::Success(peer_info) => {
-                        let ip_v4_peers: Vec<Peer> = peer_info
-                            .peers
-                            .into_iter()
-                            .filter(|peer| !peer.ip.contains(":"))
-                            .collect();
+                        let ip_v4_peers = peer_info.ip_v4_peers();
+
+                        let _ = self
+                            .progress_tx
+                            .send(crate::tui::ProgressEvent::TrackerPeers {
+                                count: ip_v4_peers.len(),
+                            });
 
                         ConnectionManager::new(
                             torr.info.piece_length,
@@ -80,10 +86,10 @@ impl DownloadTask {
                             peer_id,
                             pieces,
                             peer_info.interval,
+                            tracker_request,
                             serializer.unwrap(),
                             self.progress_tx.clone(),
                         )
-                        .await
                         .download()
                         .await;
                     }

@@ -4,13 +4,34 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::mpsc,
+    time::Instant,
 };
 
 use super::{
     connection_manager::{Bitfield, ManagerMessage},
-    constants::{HANDSHAKE_MESSAGE, MAX_OUTBOUND_REQUESTS, REQUEST_BLOCK_SIZE},
+    constants::{
+        CONNECT_TIMEOUT, HANDSHAKE_MESSAGE, HANDSHAKE_TIMEOUT, KEEPALIVE_INTERVAL,
+        MAX_OUTBOUND_REQUESTS, REQUEST_BLOCK_SIZE,
+    },
     tracker::Peer,
 };
+
+const HANDSHAKE_LENGTH: usize = 68;
+
+async fn timed_out<T>(
+    limit: std::time::Duration,
+    operation: impl Future<Output = std::io::Result<T>>,
+    stage: &'static str,
+) -> std::io::Result<T> {
+    tokio::time::timeout(limit, operation)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{stage} timed out"),
+            ))
+        })
+}
 
 #[derive(Debug, Clone)]
 enum Messages {
@@ -153,10 +174,10 @@ pub enum ConnectionMessage {
 
 #[derive(Debug)]
 pub struct ConnectionHandle {
-    pub peer_ip: String,
+    pub address: String,
     pub choked: bool,
-    pub not_interested: bool,
     pub is_downloading: bool,
+    pub current_piece: Option<u32>,
     pub available_pieces: Vec<u32>,
 
     pub tx: mpsc::Sender<ConnectionMessage>,
@@ -224,22 +245,38 @@ impl Connection {
         peer: Peer,
         tx: mpsc::Sender<ManagerMessage>,
     ) -> std::io::Result<Self> {
-        let mut stream = TcpStream::connect(format!("{}:{}", peer.ip, peer.port)).await?;
+        let mut stream = timed_out(
+            CONNECT_TIMEOUT,
+            TcpStream::connect(peer.address()),
+            "connect",
+        )
+        .await?;
+
+        let _ = tx
+            .send(ManagerMessage::Handshaking(peer.address()))
+            .await;
 
         let handshake = Self::construct_handshake(raw_info_hash, raw_peer_id);
-        let mut data = vec![0; 68];
+        let mut data = vec![0; HANDSHAKE_LENGTH];
 
-        stream.write(&handshake).await?;
+        timed_out(
+            HANDSHAKE_TIMEOUT,
+            async {
+                stream.write_all(&handshake).await?;
+                stream.read_exact(&mut data).await
+            },
+            "handshake",
+        )
+        .await?;
 
-        stream.read(&mut data).await?;
+        if data[28..48] != handshake[28..48] {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "info hash mismatch",
+            ));
+        }
 
-        let success_message = if data[28..48] == handshake[28..48] {
-            "-> Success"
-        } else {
-            "-> Failure"
-        };
-
-        tracing::info!("Peer: {} {}", peer.ip, success_message);
+        tracing::info!("Peer: {} -> Success", peer.address());
 
         let (conn_tx, rx) = mpsc::channel::<ConnectionMessage>(100);
 
@@ -262,10 +299,10 @@ impl Connection {
 
     pub fn create_handle(&self) -> ConnectionHandle {
         ConnectionHandle {
-            peer_ip: self.peer.ip.clone(),
+            address: self.peer.address(),
             choked: self.choked,
-            not_interested: self.not_interested,
             is_downloading: false,
+            current_piece: None,
             available_pieces: self.available_pieces.clone(),
 
             tx: self.conn_tx.clone(),
@@ -273,24 +310,43 @@ impl Connection {
     }
 
     pub async fn serve(&mut self) {
+        let mut last_write = Instant::now();
+
         loop {
             tokio::select! {
+                _ = tokio::time::sleep_until(last_write + KEEPALIVE_INTERVAL) => {
+                    Self::write_message(&mut self.stream, &Messages::keepalive(), &mut last_write).await;
+                }
                 result = Self::read_message(&mut self.stream) => {
-                    if let Ok(message) = result {
-                        match message {
+                    match result {
+                        Err(error) => {
+                            tracing::info!("Peer {} disconnected: {}", self.peer.address(), error);
+                            return;
+                        }
+                        Ok(message) => match message {
                             Messages::Have(piece_index) => {
                                 self.available_pieces.push(piece_index);
 
                                 let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
-                                    self.peer.ip.clone(),
+                                    self.peer.address(),
                                     vec![piece_index],
                                 ));
                             }
                             Messages::Choke => {
                                 self.choked = true;
+
+                                let _ = self.tx.try_send(ManagerMessage::ChokeState(
+                                    self.peer.address(),
+                                    true,
+                                ));
                             }
                             Messages::Unchoke => {
                                 self.choked = false;
+
+                                let _ = self.tx.try_send(ManagerMessage::ChokeState(
+                                    self.peer.address(),
+                                    false,
+                                ));
                             }
                             Messages::Interested => {
                                 self.not_interested = false;
@@ -304,7 +360,7 @@ impl Connection {
                                 self.available_pieces.extend(&piece_indexes);
 
                                 let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
-                                    self.peer.ip.clone(),
+                                    self.peer.address(),
                                     piece_indexes,
                                 ));
                             }
@@ -318,7 +374,7 @@ impl Connection {
                                     self.in_flight_requests.remove(position);
 
                                     if let Some(request) = self.download_pipeline.pop_back() {
-                                        Self::write_message(&mut self.stream, &request).await;
+                                        Self::write_message(&mut self.stream, &request, &mut last_write).await;
                                         self.in_flight_requests.push(request);
                                     }
                                 }
@@ -331,7 +387,7 @@ impl Connection {
 
                                     if piece_progress.is_finished() {
                                         let _ = self.tx.try_send(ManagerMessage::PieceRecieved(
-                                            self.peer.ip.clone(),
+                                            self.peer.address(),
                                             index,
                                             piece_progress.piece.clone(),
                                         ));
@@ -350,7 +406,7 @@ impl Connection {
 
                     match instruction {
                         ConnectionMessage::PieceRequest(index) => {
-                            Self::write_message(&mut self.stream, &Messages::Interested).await;
+                            Self::write_message(&mut self.stream, &Messages::Interested, &mut last_write).await;
                             self.not_interested = false;
 
                             tracing::info!("PIECE LENGTH {}", self.piece_length);
@@ -370,7 +426,7 @@ impl Connection {
 
                                 tracing::info!("Sending {:?} requests for piece {}", request, index);
 
-                                Self::write_message(&mut self.stream, &request).await;
+                                Self::write_message(&mut self.stream, &request, &mut last_write).await;
                                 self.in_flight_requests.push(request);
                             }
                         }
@@ -387,7 +443,7 @@ impl Connection {
 
                             for request in cancelled {
                                 let (idx, begin, length) = request.get_request_fields().unwrap();
-                                Self::write_message(&mut self.stream, &Messages::Cancel(idx, begin, length)).await;
+                                Self::write_message(&mut self.stream, &Messages::Cancel(idx, begin, length), &mut last_write).await;
                             }
 
                             self.in_flight_requests
@@ -397,7 +453,7 @@ impl Connection {
                             while self.in_flight_requests.len() < MAX_OUTBOUND_REQUESTS && self.download_pipeline.len() > 0 {
                                 let request = self.download_pipeline.pop_back().unwrap();
 
-                                Self::write_message(&mut self.stream, &request).await;
+                                Self::write_message(&mut self.stream, &request, &mut last_write).await;
                                 self.in_flight_requests.push(request);
                             }
                         }
@@ -407,10 +463,6 @@ impl Connection {
 
             }
         }
-    }
-
-    pub fn get_peer(&self) -> Peer {
-        self.peer.clone()
     }
 
     async fn read_message(stream: &mut TcpStream) -> std::io::Result<Messages> {
@@ -432,8 +484,10 @@ impl Connection {
         ))
     }
 
-    async fn write_message(stream: &mut TcpStream, message: &Messages) {
+    async fn write_message(stream: &mut TcpStream, message: &Messages, last_write: &mut Instant) {
         let _ = stream.write_all(&message.to_bytes()).await;
+
+        *last_write = Instant::now();
     }
 
     fn construct_handshake(raw_info_hash: &[u8], raw_peer_id: &[u8]) -> Vec<u8> {
@@ -449,5 +503,93 @@ impl Connection {
         handshake.extend_from_slice(raw_peer_id);
 
         handshake
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    async fn idle_connection() -> (Connection, TcpStream, mpsc::Receiver<ManagerMessage>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (peer_side, _) = listener.accept().await.unwrap();
+
+        let (tx, manager_rx) = mpsc::channel(32);
+        let (conn_tx, rx) = mpsc::channel(32);
+
+        let connection = Connection {
+            peer: Peer {
+                ip: "127.0.0.1".to_string(),
+                port: address.port(),
+            },
+            stream,
+            choked: true,
+            not_interested: true,
+            piece_length: REQUEST_BLOCK_SIZE,
+            available_pieces: vec![],
+            tx,
+            rx,
+            conn_tx,
+            download_pipeline: VecDeque::new(),
+            in_flight_requests: vec![],
+            request_block_count: 1,
+            in_progress: HashMap::new(),
+        };
+
+        (connection, peer_side, manager_rx)
+    }
+
+    #[test]
+    fn a_keep_alive_is_four_zero_bytes_on_the_wire() {
+        assert_eq!(Messages::keepalive().to_bytes(), vec![0, 0, 0, 0]);
+    }
+
+    // Paused time auto-advances to the next timer once every task is idle, so
+    // asserting a keep-alive *arrives* proves nothing. Assert when it arrives.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_is_kept_alive_after_exactly_one_interval() {
+        let (mut connection, mut peer, _manager_rx) = idle_connection().await;
+        let opened_at = Instant::now();
+
+        tokio::spawn(async move { connection.serve().await });
+
+        let mut received = [0u8; 4];
+        peer.read_exact(&mut received).await.unwrap();
+
+        assert_eq!(received, [0, 0, 0, 0]);
+        assert_eq!(opened_at.elapsed(), KEEPALIVE_INTERVAL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_postpones_the_next_keep_alive_by_a_full_interval() {
+        let (mut connection, mut peer, _manager_rx) = idle_connection().await;
+        let instructions = connection.conn_tx.clone();
+
+        tokio::spawn(async move { connection.serve().await });
+
+        tokio::time::sleep(KEEPALIVE_INTERVAL / 2).await;
+
+        let requested_at = Instant::now();
+
+        instructions
+            .send(ConnectionMessage::PieceRequest(0))
+            .await
+            .unwrap();
+
+        let mut interested_and_request = [0u8; 5 + 17];
+        peer.read_exact(&mut interested_and_request).await.unwrap();
+
+        let mut received = [0u8; 4];
+        peer.read_exact(&mut received).await.unwrap();
+
+        assert_eq!(received, [0, 0, 0, 0]);
+        assert_eq!(requested_at.elapsed(), KEEPALIVE_INTERVAL);
     }
 }
