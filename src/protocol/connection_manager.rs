@@ -7,7 +7,9 @@ use crate::{protocol::piece_selection::PieceSelection, tui::ProgressEvent};
 
 use super::{
     connection::{Connection, ConnectionHandle, ConnectionMessage},
-    constants::{MIN_ANNOUNCE_GAP, PEER_FLOOR, ROSTER_CAP, TARGET_LIVE_PEERS},
+    constants::{
+        END_GAME_PIECE_THRESHOLD, MIN_ANNOUNCE_GAP, PEER_FLOOR, ROSTER_CAP, TARGET_LIVE_PEERS,
+    },
     file_serializer::FileSerializer,
     peer_roster::{Lifecycle, Roster},
     piece_layout::PieceLayout,
@@ -400,7 +402,7 @@ impl ConnectionManager {
 
                     let _ = self.progress_tx.send(ProgressEvent::HashMismatch { index });
 
-                    self.requested_pieces.remove(&index);
+                    self.abandon_request(index, &from);
                     self.fill_request_slots();
                     self.publish_peers();
 
@@ -459,7 +461,7 @@ impl ConnectionManager {
             }
         }
 
-        if self.all_pieces_requested() {
+        if self.should_enter_end_game() {
             tracing::info!("Entering end game mode");
 
             let _ = self.progress_tx.send(ProgressEvent::EndGame);
@@ -538,13 +540,19 @@ impl ConnectionManager {
         (0..self.piece_hashes.len() as u32).filter(|index| !self.bitfield.check_piece(*index))
     }
 
-    fn all_pieces_requested(&self) -> bool {
-        let mut missing = self.missing_pieces().peekable();
+    // BEP 3 starts end game once every missing piece is spoken for. That alone
+    // can never fire if the last pieces are held only by peers that have us
+    // choked, so a small enough remainder starts it too and the tail of a
+    // download cannot sit idle waiting for an assignment it will never get.
+    fn should_enter_end_game(&self) -> bool {
+        let missing = self.missing_pieces().count();
 
-        missing.peek().is_some()
-            && self
-                .missing_pieces()
-                .all(|index| self.requested_pieces.contains(&index))
+        let unassigned = self
+            .missing_pieces()
+            .filter(|index| !self.requested_pieces.contains(index))
+            .count();
+
+        missing > 0 && (unassigned == 0 || missing <= END_GAME_PIECE_THRESHOLD)
     }
 
     // End game: every remaining piece has already been assigned to one peer,

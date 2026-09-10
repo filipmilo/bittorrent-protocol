@@ -6,6 +6,7 @@ pub const HANDSHAKE_MESSAGE: &[u8; 19] = b"BitTorrent protocol";
 pub const MAX_OUTBOUND_REQUESTS: usize = 5;
 pub const NUMBER_OF_WANTED_PEERS: usize = 100;
 pub const RAREST_FIRST_DOWNLOAD_COUNT_THRESHOLD: u32 = 4;
+pub const END_GAME_PIECE_THRESHOLD: usize = 5;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TARGET_LIVE_PEERS: usize = 50;
