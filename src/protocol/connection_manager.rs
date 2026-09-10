@@ -18,63 +18,55 @@ use super::{
 #[derive(Debug)]
 pub struct Bitfield {
     value: Vec<u8>,
+    piece_count: usize,
 }
 
 impl Bitfield {
-    pub fn new(piece_number: usize) -> Self {
+    pub fn new(piece_count: usize) -> Self {
         Self {
-            value: vec![0; (piece_number as f64 / 8.0).ceil() as usize],
+            value: vec![0; piece_count.div_ceil(8)],
+            piece_count,
         }
     }
 
-    pub fn from(pieces: Vec<u8>) -> Self {
-        Self { value: pieces }
+    // A peer's bitfield is padded to a byte boundary and arrives from the
+    // network, so it is read through `piece_count` rather than trusted for its
+    // length: spare bits cannot invent pieces and a short one cannot panic.
+    pub fn from(pieces: Vec<u8>, piece_count: usize) -> Self {
+        Self {
+            value: pieces,
+            piece_count,
+        }
     }
 
     pub fn check_piece(&self, piece_index: u32) -> bool {
-        let byte_index = piece_index / 8;
-        let bit_index = piece_index % 8;
+        let byte_index = (piece_index / 8) as usize;
+        let mask = 1 << (7 - piece_index % 8);
 
-        let mask = 1 << (7 - bit_index);
-
-        return (self.value[byte_index as usize] & mask) != 0;
+        self.value
+            .get(byte_index)
+            .is_some_and(|byte| byte & mask != 0)
     }
 
     pub fn set_downloaded(&mut self, piece_index: usize) {
         let byte_index = piece_index / 8;
-        let bit_index = piece_index % 8;
-
-        let mask = 1 << (7 - bit_index);
+        let mask = 1 << (7 - piece_index % 8);
 
         self.value[byte_index] |= mask;
     }
 
+    fn indexes(&self) -> impl Iterator<Item = u32> {
+        0..self.piece_count as u32
+    }
+
     pub fn get_available_pieces(&self) -> Vec<u32> {
-        self.value
-            .iter()
-            .enumerate()
-            .flat_map(|entry| {
-                let (index, byte) = entry;
-
-                let mut indexes: Vec<u32> = vec![];
-
-                for i in 0..8 {
-                    let bit_mask = 7 - i;
-
-                    if byte & (1 << bit_mask) != 0 {
-                        indexes.push((i + (8 * index)) as u32)
-                    }
-                }
-
-                indexes
-            })
+        self.indexes()
+            .filter(|index| self.check_piece(*index))
             .collect()
     }
 
     pub fn is_completed(&self) -> bool {
-        self.value
-            .iter()
-            .all(|bitfield_section| *bitfield_section == u8::MAX)
+        self.indexes().all(|index| self.check_piece(index))
     }
 }
 
@@ -510,5 +502,79 @@ impl ConnectionManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn completed(piece_count: usize) -> Bitfield {
+        let mut bitfield = Bitfield::new(piece_count);
+
+        (0..piece_count).for_each(|index| bitfield.set_downloaded(index));
+
+        bitfield
+    }
+
+    #[test]
+    fn a_fresh_bitfield_holds_no_pieces() {
+        let bitfield = Bitfield::new(21754);
+
+        assert!(!bitfield.is_completed());
+        assert!(bitfield.get_available_pieces().is_empty());
+    }
+
+    #[test]
+    fn a_downloaded_piece_reads_back() {
+        let mut bitfield = Bitfield::new(20);
+
+        bitfield.set_downloaded(0);
+        bitfield.set_downloaded(7);
+        bitfield.set_downloaded(19);
+
+        assert_eq!(bitfield.get_available_pieces(), vec![0, 7, 19]);
+    }
+
+    // The Debian torrent has 3136 pieces and passed on the old byte-wise check
+    // by luck; the Ubuntu torrent has 21754, leaving six spare bits that could
+    // never be set, so the download could never report itself finished.
+    #[test]
+    fn a_piece_count_that_is_not_a_multiple_of_eight_can_still_complete() {
+        assert_ne!(21754 % 8, 0);
+
+        assert!(completed(21754).is_completed());
+    }
+
+    #[test]
+    fn a_piece_count_that_fills_its_last_byte_can_still_complete() {
+        assert_eq!(3136 % 8, 0);
+
+        assert!(completed(3136).is_completed());
+    }
+
+    #[test]
+    fn one_missing_piece_keeps_a_download_incomplete() {
+        let mut bitfield = completed(21754);
+
+        bitfield.value[0] &= 0b0111_1111;
+
+        assert!(!bitfield.is_completed());
+        assert!(!bitfield.check_piece(0));
+    }
+
+    #[test]
+    fn spare_bits_in_a_peers_bitfield_do_not_invent_pieces() {
+        let bitfield = Bitfield::from(vec![0xFF, 0xFF], 10);
+
+        assert_eq!(bitfield.get_available_pieces(), (0..10).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn a_peer_bitfield_shorter_than_the_torrent_reports_what_it_has() {
+        let bitfield = Bitfield::from(vec![0xFF], 21754);
+
+        assert_eq!(bitfield.get_available_pieces(), (0..8).collect::<Vec<u32>>());
+        assert!(!bitfield.check_piece(21753));
     }
 }

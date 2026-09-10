@@ -31,10 +31,6 @@ impl PieceLayout {
             .min(self.piece_length) as usize
     }
 
-    pub fn block_count(&self, index: u32) -> usize {
-        self.piece_size(index).div_ceil(REQUEST_BLOCK_SIZE)
-    }
-
     /// `(begin, length)` for each block of `index`, the last one truncated.
     pub fn blocks(&self, index: u32) -> Vec<(u32, u32)> {
         let size = self.piece_size(index);
@@ -67,7 +63,7 @@ mod tests {
     fn an_evenly_divided_torrent_has_a_full_final_piece() {
         assert_eq!(even().piece_count(), 3136);
         assert_eq!(even().piece_size(3135), PIECE as usize);
-        assert_eq!(even().block_count(3135), 16);
+        assert_eq!(even().blocks(3135).len(), 16);
     }
 
     #[test]
@@ -79,8 +75,8 @@ mod tests {
 
     #[test]
     fn a_short_final_piece_needs_fewer_blocks_than_a_full_one() {
-        assert_eq!(ragged().block_count(21752), 16);
-        assert_eq!(ragged().block_count(21753), 7);
+        assert_eq!(ragged().blocks(21752).len(), 16);
+        assert_eq!(ragged().blocks(21753).len(), 7);
     }
 
     #[test]

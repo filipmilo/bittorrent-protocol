@@ -354,7 +354,8 @@ impl Connection {
                                 self.not_interested = true;
                             }
                             Messages::Bitfield(bitfield) => {
-                                let piece_indexes = Bitfield::from(bitfield).get_available_pieces();
+                                let piece_indexes = Bitfield::from(bitfield, self.layout.piece_count())
+                                    .get_available_pieces();
 
                                 self.available_pieces.extend(&piece_indexes);
 
