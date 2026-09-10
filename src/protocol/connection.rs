@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -179,9 +179,19 @@ pub struct ConnectionHandle {
     pub choked: bool,
     pub is_downloading: bool,
     pub current_piece: Option<u32>,
-    pub available_pieces: Vec<u32>,
+    pub available_pieces: HashSet<u32>,
 
     pub tx: mpsc::Sender<ConnectionMessage>,
+}
+
+impl ConnectionHandle {
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.is_alive() && !self.is_downloading
+    }
 }
 
 #[derive(Debug)]
@@ -223,7 +233,6 @@ pub struct Connection {
     choked: bool,
     not_interested: bool,
     layout: PieceLayout,
-    available_pieces: Vec<u32>,
 
     tx: mpsc::Sender<ManagerMessage>,
 
@@ -289,7 +298,6 @@ impl Connection {
             peer,
             choked: true,
             not_interested: true,
-            available_pieces: vec![],
             download_pipeline: VecDeque::new(),
             in_flight_requests: vec![],
             in_progress: HashMap::new(),
@@ -302,7 +310,7 @@ impl Connection {
             choked: self.choked,
             is_downloading: false,
             current_piece: None,
-            available_pieces: self.available_pieces.clone(),
+            available_pieces: HashSet::new(),
 
             tx: self.conn_tx.clone(),
         }
@@ -324,8 +332,6 @@ impl Connection {
                         }
                         Ok(message) => match message {
                             Messages::Have(piece_index) => {
-                                self.available_pieces.push(piece_index);
-
                                 let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
                                     self.peer.address(),
                                     vec![piece_index],
@@ -356,8 +362,6 @@ impl Connection {
                             Messages::Bitfield(bitfield) => {
                                 let piece_indexes = Bitfield::from(bitfield, self.layout.piece_count())
                                     .get_available_pieces();
-
-                                self.available_pieces.extend(&piece_indexes);
 
                                 let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
                                     self.peer.address(),
@@ -555,7 +559,6 @@ mod tests {
             choked: true,
             not_interested: true,
             layout: PieceLayout::new(REQUEST_BLOCK_SIZE as u64, REQUEST_BLOCK_SIZE as u64),
-            available_pieces: vec![],
             tx,
             rx,
             conn_tx,

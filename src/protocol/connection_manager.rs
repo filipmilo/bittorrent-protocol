@@ -330,13 +330,18 @@ impl ConnectionManager {
                 // piece per peer. Only the first announcement adds a table row.
                 let joined_the_swarm = conn.available_pieces.is_empty();
 
-                conn.available_pieces.extend(&pieces);
+                // Counted once per peer per piece, so losing the peer can take
+                // exactly as much back off again.
+                let fresh = pieces
+                    .into_iter()
+                    .filter(|piece| conn.available_pieces.insert(*piece))
+                    .collect::<Vec<u32>>();
 
-                for piece in pieces {
+                for piece in fresh {
                     self.piece_availability.increment_piece(piece as usize);
                 }
 
-                self.requrest_next_piece();
+                self.fill_request_slots();
 
                 if joined_the_swarm {
                     self.publish_peers();
@@ -371,7 +376,7 @@ impl ConnectionManager {
                     let _ = self.progress_tx.send(ProgressEvent::HashMismatch { index });
 
                     self.requested_pieces.remove(&index);
-                    self.requrest_next_piece();
+                    self.fill_request_slots();
                     self.publish_peers();
 
                     return false;
@@ -391,7 +396,7 @@ impl ConnectionManager {
                         return true;
                     }
 
-                    self.requrest_next_piece();
+                    self.fill_request_slots();
                 }
 
                 self.publish_peers();
@@ -407,37 +412,25 @@ impl ConnectionManager {
             .send(ProgressEvent::Peers(self.roster.rows(&self.connections)));
     }
 
-    fn requrest_next_piece(&mut self) {
+    // Every idle peer gets something to do, and each is given the rarest piece
+    // *it* holds rather than one piece being sought globally: a single global
+    // choice leaves peers idle whenever they happen not to hold it.
+    fn fill_request_slots(&mut self) {
         if self.end_game {
             self.broadcast_end_game_requests();
             return;
         }
 
-        let index = self.piece_availability.get_next_piece_index(&self.bitfield) as u32;
+        let idle = self
+            .connections
+            .values()
+            .filter(|conn| conn.is_available())
+            .map(|conn| conn.address.clone())
+            .collect::<Vec<String>>();
 
-        let handle = self.connections.values_mut().find(|conn_handle| {
-            !conn_handle.is_downloading
-                && !conn_handle.tx.is_closed()
-                && conn_handle.available_pieces.contains(&index)
-        });
-
-        match handle {
-            Some(conn) => {
-                let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(index));
-                conn.is_downloading = true;
-                conn.current_piece = Some(index);
-
-                self.requested_pieces.insert(index);
-                self.piece_owners
-                    .entry(index)
-                    .or_default()
-                    .insert(conn.address.clone());
-            }
-            None => {
-                tracing::info!(
-                    "No connection available or all connections are downloading for piece : {}",
-                    index,
-                );
+        for address in idle {
+            if let Some(index) = self.next_piece_for(&address) {
+                self.assign(&address, index);
             }
         }
 
@@ -451,9 +444,47 @@ impl ConnectionManager {
         }
     }
 
+    fn next_piece_for(&self, address: &str) -> Option<u32> {
+        let conn = self.connections.get(address)?;
+
+        self.piece_availability
+            .select(&conn.available_pieces, &self.bitfield, &self.requested_pieces)
+    }
+
+    fn assign(&mut self, address: &str, index: u32) {
+        let Some(conn) = self.connections.get_mut(address) else {
+            return;
+        };
+
+        if conn
+            .tx
+            .try_send(ConnectionMessage::PieceRequest(index))
+            .is_err()
+        {
+            return;
+        }
+
+        conn.is_downloading = true;
+        conn.current_piece = Some(index);
+
+        self.requested_pieces.insert(index);
+        self.piece_owners
+            .entry(index)
+            .or_default()
+            .insert(address.to_string());
+    }
+
+    fn missing_pieces(&self) -> impl Iterator<Item = u32> {
+        (0..self.piece_hashes.len() as u32).filter(|index| !self.bitfield.check_piece(*index))
+    }
+
     fn all_pieces_requested(&self) -> bool {
-        self.requested_pieces.len()
-            == self.piece_hashes.len() - (self.piece_availability.downloaded_count as usize)
+        let mut missing = self.missing_pieces().peekable();
+
+        missing.peek().is_some()
+            && self
+                .missing_pieces()
+                .all(|index| self.requested_pieces.contains(&index))
     }
 
     // End game: every remaining piece has already been assigned to one peer,
