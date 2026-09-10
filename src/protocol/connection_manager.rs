@@ -320,10 +320,28 @@ impl ConnectionManager {
                 false
             }
             ManagerMessage::ChokeState(peer_ip, choked) => {
-                if let Some(conn) = self.connections.get_mut(&peer_ip) {
-                    conn.choked = choked;
+                let Some(conn) = self.connections.get_mut(&peer_ip) else {
+                    return false;
+                };
+
+                conn.choked = choked;
+
+                // Being choked voids whatever this peer was asked for, so the
+                // slot is freed and the piece goes back to be asked elsewhere.
+                let abandoned = match choked {
+                    true => conn.current_piece.take(),
+                    false => None,
+                };
+
+                if abandoned.is_some() {
+                    conn.is_downloading = false;
                 }
 
+                if let Some(index) = abandoned {
+                    self.abandon_request(index, &peer_ip);
+                }
+
+                self.fill_request_slots();
                 self.publish_peers();
 
                 false

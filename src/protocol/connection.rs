@@ -87,75 +87,42 @@ impl Messages {
         }
     }
 
+    // Every message is its length as a big-endian u32 followed by that many
+    // bytes, so the prefix is derived from the payload rather than restated per
+    // variant -- Have and Bitfield used to declare the wrong one.
     fn to_bytes(&self) -> Vec<u8> {
-        let (header, payload): ([u8; 4], Vec<u8>) = match self {
-            Self::Choke => ([0, 0, 0, 1], vec![0]),
-            Self::Unchoke => ([0, 0, 0, 1], vec![1]),
-            Self::Interested => ([0, 0, 0, 1], vec![2]),
-            Self::NotInterested => ([0, 0, 0, 1], vec![3]),
-            Self::Have(piece_index) => (
-                (*piece_index as u32).to_be_bytes(),
-                vec![4]
-                    .iter()
-                    .chain((*piece_index as u32).to_be_bytes().iter())
-                    .cloned()
-                    .collect(),
-            ),
-
-            Self::Bitfield(bitfield) => (
-                (bitfield.len() as u32).to_be_bytes(),
-                vec![5].iter().chain(bitfield.iter()).cloned().collect(),
-            ),
-
-            Self::Request(index, begin, length) => {
-                let index_bytes = index.to_be_bytes();
-                let begin_bytes = begin.to_be_bytes();
-                let length_bytes = length.to_be_bytes();
-
-                let payload_length = index_bytes.len() + begin_bytes.len() + length_bytes.len() + 1;
-                let mut payload = Vec::with_capacity(payload_length);
-
-                payload.extend_from_slice(&[6]);
-                payload.extend_from_slice(&index_bytes);
-                payload.extend_from_slice(&begin_bytes);
-                payload.extend_from_slice(&length_bytes);
-
-                ((payload_length as u32).to_be_bytes(), payload)
-            }
-            Self::Piece(index, begin, piece) => {
-                let index_bytes = index.to_be_bytes();
-                let begin_bytes = begin.to_be_bytes();
-
-                let payload_length = index_bytes.len() + begin_bytes.len() + piece.len() + 1;
-                let mut payload = Vec::with_capacity(payload_length);
-
-                payload.extend_from_slice(&[7]);
-                payload.extend_from_slice(&index_bytes);
-                payload.extend_from_slice(&begin_bytes);
-                payload.extend_from_slice(&piece);
-
-                ((payload_length as u32).to_be_bytes(), payload)
-            }
-            Self::Cancel(index, begin, length) => {
-                let index_bytes = index.to_be_bytes();
-                let begin_bytes = begin.to_be_bytes();
-                let length_bytes = length.to_be_bytes();
-
-                let payload_length = index_bytes.len() + begin_bytes.len() + length_bytes.len() + 1;
-                let mut payload = Vec::with_capacity(payload_length);
-
-                payload.extend_from_slice(&[8]);
-                payload.extend_from_slice(&index_bytes);
-                payload.extend_from_slice(&begin_bytes);
-                payload.extend_from_slice(&length_bytes);
-
-                ((payload_length as u32).to_be_bytes(), payload)
-            }
-
-            Self::KeepAlive => ([0, 0, 0, 0], vec![]),
+        let payload: Vec<u8> = match self {
+            Self::KeepAlive => vec![],
+            Self::Choke => vec![0],
+            Self::Unchoke => vec![1],
+            Self::Interested => vec![2],
+            Self::NotInterested => vec![3],
+            Self::Have(index) => [&[4][..], &index.to_be_bytes()].concat(),
+            Self::Bitfield(bitfield) => [&[5][..], bitfield].concat(),
+            Self::Request(index, begin, length) => [
+                &[6][..],
+                &index.to_be_bytes(),
+                &begin.to_be_bytes(),
+                &length.to_be_bytes(),
+            ]
+            .concat(),
+            Self::Piece(index, begin, block) => [
+                &[7][..],
+                &index.to_be_bytes(),
+                &begin.to_be_bytes(),
+                block,
+            ]
+            .concat(),
+            Self::Cancel(index, begin, length) => [
+                &[8][..],
+                &index.to_be_bytes(),
+                &begin.to_be_bytes(),
+                &length.to_be_bytes(),
+            ]
+            .concat(),
         };
 
-        header.into_iter().chain(payload).collect()
+        [&(payload.len() as u32).to_be_bytes()[..], &payload].concat()
     }
 
     fn get_request_fields(&self) -> Option<(u32, u32, u32)> {
@@ -190,7 +157,7 @@ impl ConnectionHandle {
     }
 
     pub fn is_available(&self) -> bool {
-        self.is_alive() && !self.is_downloading
+        self.is_alive() && !self.is_downloading && !self.choked
     }
 }
 
@@ -231,7 +198,7 @@ pub struct Connection {
     peer: Peer,
     stream: TcpStream,
     choked: bool,
-    not_interested: bool,
+    am_interested: bool,
     layout: PieceLayout,
 
     tx: mpsc::Sender<ManagerMessage>,
@@ -297,7 +264,7 @@ impl Connection {
             stream,
             peer,
             choked: true,
-            not_interested: true,
+            am_interested: false,
             download_pipeline: VecDeque::new(),
             in_flight_requests: vec![],
             in_progress: HashMap::new(),
@@ -338,6 +305,8 @@ impl Connection {
                         }
                         Ok(message) => match message {
                             Messages::Have(piece_index) => {
+                                Self::declare_interest(&mut self.stream, &mut self.am_interested, &mut last_write).await;
+
                                 let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
                                     self.peer.address(),
                                     vec![piece_index],
@@ -345,6 +314,12 @@ impl Connection {
                             }
                             Messages::Choke => {
                                 self.choked = true;
+
+                                // A choked peer discards what it was already
+                                // asked for, so nothing outstanding is coming.
+                                self.download_pipeline.clear();
+                                self.in_flight_requests.clear();
+                                self.in_progress.clear();
 
                                 let _ = self.tx.try_send(ManagerMessage::ChokeState(
                                     self.peer.address(),
@@ -359,15 +334,13 @@ impl Connection {
                                     false,
                                 ));
                             }
-                            Messages::Interested => {
-                                self.not_interested = false;
-                            }
-                            Messages::NotInterested => {
-                                self.not_interested = true;
-                            }
                             Messages::Bitfield(bitfield) => {
                                 let piece_indexes = Bitfield::from(bitfield, self.layout.piece_count())
                                     .get_available_pieces();
+
+                                if !piece_indexes.is_empty() {
+                                    Self::declare_interest(&mut self.stream, &mut self.am_interested, &mut last_write).await;
+                                }
 
                                 let _ = self.tx.try_send(ManagerMessage::PiecesAvailable(
                                     self.peer.address(),
@@ -419,8 +392,7 @@ impl Connection {
 
                     match instruction {
                         ConnectionMessage::PieceRequest(index) => {
-                            Self::write_message(&mut self.stream, &Messages::Interested, &mut last_write).await;
-                            self.not_interested = false;
+                            Self::declare_interest(&mut self.stream, &mut self.am_interested, &mut last_write).await;
 
                             let blocks = self.layout.blocks(index);
 
@@ -499,6 +471,23 @@ impl Connection {
         ))
     }
 
+    // BEP 3 unchokes the peers that are interested, so interest has to be
+    // declared as soon as the peer announces something worth having. Sending it
+    // only alongside the first request leaves the peer with no reason to have
+    // unchoked us yet, and a choked peer drops that request on the floor.
+    async fn declare_interest(
+        stream: &mut TcpStream,
+        am_interested: &mut bool,
+        last_write: &mut Instant,
+    ) {
+        if *am_interested {
+            return;
+        }
+
+        Self::write_message(stream, &Messages::Interested, last_write).await;
+        *am_interested = true;
+    }
+
     // Keeps `MAX_OUTBOUND_REQUESTS` blocks on the wire so the peer always has
     // work queued; the pipeline is drained in order, which keeps every block of
     // one piece ahead of the next piece's (BEP 3 strict priority).
@@ -563,7 +552,7 @@ mod tests {
             },
             stream,
             choked: true,
-            not_interested: true,
+            am_interested: false,
             layout: PieceLayout::new(REQUEST_BLOCK_SIZE as u64, REQUEST_BLOCK_SIZE as u64),
             tx,
             rx,
@@ -579,6 +568,96 @@ mod tests {
     #[test]
     fn a_keep_alive_is_four_zero_bytes_on_the_wire() {
         assert_eq!(Messages::keepalive().to_bytes(), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn every_message_declares_the_length_that_follows_it() {
+        let messages = [
+            Messages::Choke,
+            Messages::Interested,
+            Messages::Have(300),
+            Messages::Bitfield(vec![0xFF; 7]),
+            Messages::Request(1, 16384, 16384),
+            Messages::Piece(1, 0, vec![0; 20]),
+            Messages::Cancel(1, 16384, 16384),
+            Messages::KeepAlive,
+        ];
+
+        for message in messages {
+            let encoded = message.to_bytes();
+            let declared = u32::from_be_bytes(encoded[0..4].try_into().unwrap());
+
+            assert_eq!(declared as usize, encoded.len() - 4, "{message:?}");
+        }
+    }
+
+    // The length prefix used to be the piece index for Have and the bitfield
+    // length for Bitfield, either of which desynchronises the peer's reader.
+    #[test]
+    fn have_and_bitfield_carry_their_own_length_not_their_contents() {
+        assert_eq!(Messages::Have(300).to_bytes()[0..4], [0, 0, 0, 5]);
+        assert_eq!(Messages::Bitfield(vec![0xFF; 7]).to_bytes()[0..4], [0, 0, 0, 8]);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_announces_pieces_is_told_we_are_interested() {
+        let (mut connection, mut peer, _manager_rx) = idle_connection().await;
+
+        tokio::spawn(async move { connection.serve().await });
+
+        peer.write_all(&Messages::Bitfield(vec![0b1000_0000]).to_bytes())
+            .await
+            .unwrap();
+
+        let mut interested = [0u8; 5];
+        peer.read_exact(&mut interested).await.unwrap();
+
+        assert_eq!(interested, [0, 0, 0, 1, 2]);
+    }
+
+    // Paused time advances to the next timer once every task is idle, so a
+    // keep-alive arriving first proves no `interested` was written before it.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_holding_nothing_is_not_told_we_are_interested() {
+        let (mut connection, mut peer, _manager_rx) = idle_connection().await;
+
+        tokio::spawn(async move { connection.serve().await });
+
+        peer.write_all(&Messages::Bitfield(vec![0b0000_0000]).to_bytes())
+            .await
+            .unwrap();
+
+        let mut next = [0u8; 4];
+        peer.read_exact(&mut next).await.unwrap();
+
+        assert_eq!(next, [0, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn interest_is_declared_once_however_many_pieces_are_announced() {
+        let (mut connection, mut peer, _manager_rx) = idle_connection().await;
+        let instructions = connection.conn_tx.clone();
+
+        tokio::spawn(async move { connection.serve().await });
+
+        peer.write_all(&Messages::Have(0).to_bytes()).await.unwrap();
+
+        let mut interested = [0u8; 5];
+        peer.read_exact(&mut interested).await.unwrap();
+        assert_eq!(interested, [0, 0, 0, 1, 2]);
+
+        peer.write_all(&Messages::Have(0).to_bytes()).await.unwrap();
+        instructions
+            .send(ConnectionMessage::PieceRequest(0))
+            .await
+            .unwrap();
+
+        // A second `interested` would leave these five bytes unread and the
+        // request would not be what arrives next.
+        let mut request = [0u8; 17];
+        peer.read_exact(&mut request).await.unwrap();
+
+        assert_eq!(request[0..5], [0, 0, 0, 13, 6]);
     }
 
     // Paused time auto-advances to the next timer once every task is idle, so
