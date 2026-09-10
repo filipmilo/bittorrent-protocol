@@ -2,6 +2,7 @@ use super::{
     bencode::Bencode,
     connection_manager::ConnectionManager,
     file_serializer::FileSerializer,
+    piece_layout::PieceLayout,
     torrent_file::{Info, TorrentFile},
     tracker::{TrackerRequest, TrackerResponse},
     utils::sha1,
@@ -33,6 +34,11 @@ impl DownloadTask {
             );
 
             let serializer = Self::open_file_serializer(&torr.info);
+
+            let layout = PieceLayout::new(
+                torr.info.piece_length,
+                torr.info.length.expect("Multi file downloads not supported."),
+            );
 
             let pieces = torr
                 .info
@@ -80,7 +86,7 @@ impl DownloadTask {
                             });
 
                         ConnectionManager::new(
-                            torr.info.piece_length,
+                            layout,
                             &ip_v4_peers,
                             raw_info_hash,
                             peer_id,

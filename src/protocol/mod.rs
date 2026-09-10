@@ -5,6 +5,7 @@ mod constants;
 pub mod download_task;
 mod file_serializer;
 mod peer_roster;
+mod piece_layout;
 mod piece_selection;
 mod torrent_file;
 mod tracker;

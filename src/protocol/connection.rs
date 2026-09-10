@@ -13,6 +13,7 @@ use super::{
         CONNECT_TIMEOUT, HANDSHAKE_MESSAGE, HANDSHAKE_TIMEOUT, KEEPALIVE_INTERVAL,
         MAX_OUTBOUND_REQUESTS, REQUEST_BLOCK_SIZE,
     },
+    piece_layout::PieceLayout,
     tracker::Peer,
 };
 
@@ -221,7 +222,7 @@ pub struct Connection {
     stream: TcpStream,
     choked: bool,
     not_interested: bool,
-    piece_length: usize,
+    layout: PieceLayout,
     available_pieces: Vec<u32>,
 
     tx: mpsc::Sender<ManagerMessage>,
@@ -232,14 +233,13 @@ pub struct Connection {
     // NOTE: Should only be a chain of Messages::Request type
     download_pipeline: VecDeque<Messages>,
     in_flight_requests: Vec<Messages>,
-    request_block_count: usize,
 
     in_progress: HashMap<u32, PieceProgress>,
 }
 
 impl Connection {
     pub async fn initialize(
-        piece_length: usize,
+        layout: PieceLayout,
         raw_info_hash: &[u8],
         raw_peer_id: &[u8],
         peer: Peer,
@@ -281,8 +281,7 @@ impl Connection {
         let (conn_tx, rx) = mpsc::channel::<ConnectionMessage>(100);
 
         Ok(Connection {
-            request_block_count: (piece_length) / REQUEST_BLOCK_SIZE,
-            piece_length,
+            layout,
             tx,
             conn_tx,
             rx,
@@ -373,10 +372,13 @@ impl Connection {
                                 }) {
                                     self.in_flight_requests.remove(position);
 
-                                    if let Some(request) = self.download_pipeline.pop_back() {
-                                        Self::write_message(&mut self.stream, &request, &mut last_write).await;
-                                        self.in_flight_requests.push(request);
-                                    }
+                                    Self::fill_pipeline(
+                                        &mut self.stream,
+                                        &mut self.download_pipeline,
+                                        &mut self.in_flight_requests,
+                                        &mut last_write,
+                                    )
+                                    .await;
                                 }
 
 
@@ -409,26 +411,27 @@ impl Connection {
                             Self::write_message(&mut self.stream, &Messages::Interested, &mut last_write).await;
                             self.not_interested = false;
 
-                            tracing::info!("PIECE LENGTH {}", self.piece_length);
+                            let blocks = self.layout.blocks(index);
 
-                            self.in_progress.insert(index, PieceProgress::new(self.piece_length, self.request_block_count));
+                            tracing::info!("Pipelining {} requests for piece {}", blocks.len(), index);
 
-                            let requests = (0..self.request_block_count).map(|val| Messages::Request(index, (val * REQUEST_BLOCK_SIZE) as u32, REQUEST_BLOCK_SIZE as u32)).rev();
+                            self.in_progress.insert(
+                                index,
+                                PieceProgress::new(self.layout.piece_size(index), blocks.len()),
+                            );
 
-                            tracing::info!("Pipelining {} requests for piece {}", requests.len(), index);
-
-                            for request in requests {
-                                self.download_pipeline.push_front(request);
+                            for (begin, length) in blocks {
+                                self.download_pipeline
+                                    .push_back(Messages::Request(index, begin, length));
                             }
 
-                            while self.in_flight_requests.len() < MAX_OUTBOUND_REQUESTS && self.download_pipeline.len() > 0 {
-                                let request = self.download_pipeline.pop_back().unwrap();
-
-                                tracing::info!("Sending {:?} requests for piece {}", request, index);
-
-                                Self::write_message(&mut self.stream, &request, &mut last_write).await;
-                                self.in_flight_requests.push(request);
-                            }
+                            Self::fill_pipeline(
+                                &mut self.stream,
+                                &mut self.download_pipeline,
+                                &mut self.in_flight_requests,
+                                &mut last_write,
+                            )
+                            .await;
                         }
                         ConnectionMessage::Cancel(index) => {
                             self.download_pipeline
@@ -450,12 +453,13 @@ impl Connection {
                                 .retain(|msg| msg.get_request_fields().unwrap().0 != index);
                             self.in_progress.remove(&index);
 
-                            while self.in_flight_requests.len() < MAX_OUTBOUND_REQUESTS && self.download_pipeline.len() > 0 {
-                                let request = self.download_pipeline.pop_back().unwrap();
-
-                                Self::write_message(&mut self.stream, &request, &mut last_write).await;
-                                self.in_flight_requests.push(request);
-                            }
+                            Self::fill_pipeline(
+                                &mut self.stream,
+                                &mut self.download_pipeline,
+                                &mut self.in_flight_requests,
+                                &mut last_write,
+                            )
+                            .await;
                         }
                     }
 
@@ -484,6 +488,25 @@ impl Connection {
         ))
     }
 
+    // Keeps `MAX_OUTBOUND_REQUESTS` blocks on the wire so the peer always has
+    // work queued; the pipeline is drained in order, which keeps every block of
+    // one piece ahead of the next piece's (BEP 3 strict priority).
+    async fn fill_pipeline(
+        stream: &mut TcpStream,
+        pipeline: &mut VecDeque<Messages>,
+        in_flight: &mut Vec<Messages>,
+        last_write: &mut Instant,
+    ) {
+        while in_flight.len() < MAX_OUTBOUND_REQUESTS {
+            let Some(request) = pipeline.pop_front() else {
+                return;
+            };
+
+            Self::write_message(stream, &request, last_write).await;
+            in_flight.push(request);
+        }
+    }
+
     async fn write_message(stream: &mut TcpStream, message: &Messages, last_write: &mut Instant) {
         let _ = stream.write_all(&message.to_bytes()).await;
 
@@ -508,8 +531,6 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use tokio::net::TcpListener;
 
     use super::*;
@@ -532,14 +553,13 @@ mod tests {
             stream,
             choked: true,
             not_interested: true,
-            piece_length: REQUEST_BLOCK_SIZE,
+            layout: PieceLayout::new(REQUEST_BLOCK_SIZE as u64, REQUEST_BLOCK_SIZE as u64),
             available_pieces: vec![],
             tx,
             rx,
             conn_tx,
             download_pipeline: VecDeque::new(),
             in_flight_requests: vec![],
-            request_block_count: 1,
             in_progress: HashMap::new(),
         };
 

@@ -10,6 +10,7 @@ use super::{
     constants::{MIN_ANNOUNCE_GAP, PEER_FLOOR, ROSTER_CAP, TARGET_LIVE_PEERS},
     file_serializer::FileSerializer,
     peer_roster::{Lifecycle, Roster},
+    piece_layout::PieceLayout,
     tracker::{Peer, TrackerRequest, TrackerResponse},
     utils::sha1,
 };
@@ -79,7 +80,7 @@ impl Bitfield {
 
 #[derive(Debug, Clone)]
 struct Dialer {
-    piece_length: usize,
+    layout: PieceLayout,
     raw_info_hash: Vec<u8>,
     peer_id: String,
 }
@@ -92,7 +93,7 @@ impl Dialer {
             let address = peer.address();
 
             match Connection::initialize(
-                dialer.piece_length,
+                dialer.layout,
                 &dialer.raw_info_hash,
                 dialer.peer_id.as_bytes(),
                 peer,
@@ -152,7 +153,7 @@ pub struct ConnectionManager {
 
 impl ConnectionManager {
     pub fn new(
-        piece_length: u64,
+        layout: PieceLayout,
         peers: &[Peer],
         raw_info_hash: Vec<u8>,
         peer_id: String,
@@ -166,7 +167,7 @@ impl ConnectionManager {
         let (announce_tx, announce_rx) = mpsc::channel::<()>(1);
 
         let dialer = Dialer {
-            piece_length: piece_length as usize,
+            layout,
             raw_info_hash,
             peer_id,
         };
