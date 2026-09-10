@@ -83,7 +83,13 @@ impl Messages {
 
                 Self::Cancel(index, begin, length)
             }
-            _ => Self::KeepAlive,
+            // Extension ids we never negotiated, ignored rather than trusted --
+            // logged because silence here once hid a peer sending us nothing we
+            // understood.
+            _ => {
+                tracing::info!("Ignoring unknown message id {} ({} bytes)", code, payload.len());
+                Self::KeepAlive
+            }
         }
     }
 
@@ -315,6 +321,8 @@ impl Connection {
                             Messages::Choke => {
                                 self.choked = true;
 
+                                tracing::info!("Peer {} choked us", self.peer.address());
+
                                 // A choked peer discards what it was already
                                 // asked for, so nothing outstanding is coming.
                                 self.download_pipeline.clear();
@@ -329,6 +337,8 @@ impl Connection {
                             Messages::Unchoke => {
                                 self.choked = false;
 
+                                tracing::info!("Peer {} unchoked us", self.peer.address());
+
                                 let _ = self.tx.try_send(ManagerMessage::ChokeState(
                                     self.peer.address(),
                                     false,
@@ -337,6 +347,12 @@ impl Connection {
                             Messages::Bitfield(bitfield) => {
                                 let piece_indexes = Bitfield::from(bitfield, self.layout.piece_count())
                                     .get_available_pieces();
+
+                                tracing::info!(
+                                    "Peer {} announced {} pieces by bitfield",
+                                    self.peer.address(),
+                                    piece_indexes.len()
+                                );
 
                                 if !piece_indexes.is_empty() {
                                     Self::declare_interest(&mut self.stream, &mut self.am_interested, &mut last_write).await;
@@ -536,6 +552,16 @@ mod tests {
     use super::*;
 
     async fn idle_connection() -> (Connection, TcpStream, mpsc::Receiver<ManagerMessage>) {
+        connection_with(PieceLayout::new(
+            REQUEST_BLOCK_SIZE as u64,
+            REQUEST_BLOCK_SIZE as u64,
+        ))
+        .await
+    }
+
+    async fn connection_with(
+        layout: PieceLayout,
+    ) -> (Connection, TcpStream, mpsc::Receiver<ManagerMessage>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
 
@@ -553,7 +579,7 @@ mod tests {
             stream,
             choked: true,
             am_interested: false,
-            layout: PieceLayout::new(REQUEST_BLOCK_SIZE as u64, REQUEST_BLOCK_SIZE as u64),
+            layout,
             tx,
             rx,
             conn_tx,
@@ -597,6 +623,105 @@ mod tests {
     fn have_and_bitfield_carry_their_own_length_not_their_contents() {
         assert_eq!(Messages::Have(300).to_bytes()[0..4], [0, 0, 0, 5]);
         assert_eq!(Messages::Bitfield(vec![0xFF; 7]).to_bytes()[0..4], [0, 0, 0, 8]);
+    }
+
+    // Two pieces of 32768 over a 40960-byte torrent: piece 0 is full (two
+    // blocks), piece 1 is 8192 bytes (one short block). This is the shape the
+    // Ubuntu torrent has and the Debian one does not.
+    fn ragged() -> PieceLayout {
+        PieceLayout::new(32768, 40960)
+    }
+
+    async fn request_and_read(
+        layout: PieceLayout,
+        index: u32,
+        bytes: usize,
+    ) -> (Vec<u8>, TcpStream, mpsc::Receiver<ManagerMessage>) {
+        let (mut connection, mut peer, manager_rx) = connection_with(layout).await;
+        let instructions = connection.conn_tx.clone();
+
+        tokio::spawn(async move { connection.serve().await });
+
+        instructions
+            .send(ConnectionMessage::PieceRequest(index))
+            .await
+            .unwrap();
+
+        let mut received = vec![0u8; bytes];
+        peer.read_exact(&mut received).await.unwrap();
+
+        (received, peer, manager_rx)
+    }
+
+    // `(index, begin, length)` of every request in a captured byte stream,
+    // skipping the `interested` that precedes them.
+    fn requests_in(bytes: &[u8]) -> Vec<(u32, u32, u32)> {
+        let mut requests = vec![];
+        let mut cursor = 0;
+
+        while cursor + 4 <= bytes.len() {
+            let length =
+                u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let body = &bytes[cursor + 4..cursor + 4 + length];
+
+            if length == 13 && body[0] == 6 {
+                let field = |n: usize| {
+                    u32::from_be_bytes(body[1 + n * 4..5 + n * 4].try_into().unwrap())
+                };
+
+                requests.push((field(0), field(1), field(2)));
+            }
+
+            cursor += 4 + length;
+        }
+
+        requests
+    }
+
+    #[tokio::test]
+    async fn a_full_piece_is_asked_for_in_whole_blocks() {
+        // interested(5) + two requests(17 each)
+        let (bytes, _peer, _rx) = request_and_read(ragged(), 0, 5 + 17 + 17).await;
+
+        let block = REQUEST_BLOCK_SIZE as u32;
+
+        assert_eq!(requests_in(&bytes), vec![(0, 0, block), (0, block, block)]);
+    }
+
+    // The bug this guards: block count came from piece_length, so the short
+    // final piece was asked for in 2 full blocks instead of 1 truncated one.
+    // The extra request runs past the end of the file and is never answered.
+    #[tokio::test(start_paused = true)]
+    async fn the_short_final_piece_is_asked_for_exactly_once_and_truncated() {
+        let (bytes, mut peer, _rx) = request_and_read(ragged(), 1, 5 + 17).await;
+
+        assert_eq!(requests_in(&bytes), vec![(1, 0, 8192)]);
+
+        // Nothing further is asked for: the next thing on the wire is a keep-alive.
+        let mut next = [0u8; 4];
+        peer.read_exact(&mut next).await.unwrap();
+
+        assert_eq!(next, [0, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn a_short_final_piece_completes_from_its_single_block() {
+        let (_bytes, mut peer, mut manager_rx) = request_and_read(ragged(), 1, 5 + 17).await;
+
+        peer.write_all(&Messages::Piece(1, 0, vec![0xAB; 8192]).to_bytes())
+            .await
+            .unwrap();
+
+        let assembled = loop {
+            match manager_rx.recv().await.unwrap() {
+                ManagerMessage::PieceRecieved(_, index, piece) => break (index, piece),
+                _ => continue,
+            }
+        };
+
+        assert_eq!(assembled.0, 1);
+        assert_eq!(assembled.1.len(), 8192, "piece sized to the ragged tail");
+        assert!(assembled.1.iter().all(|byte| *byte == 0xAB));
     }
 
     #[tokio::test]
