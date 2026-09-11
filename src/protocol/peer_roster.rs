@@ -337,7 +337,7 @@ mod tests {
             choked: false,
             is_downloading: false,
             current_piece: None,
-            available_pieces: vec![],
+            available_pieces: HashSet::new(),
             tx,
         }]);
 

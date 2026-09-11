@@ -7,9 +7,12 @@ use crate::{protocol::piece_selection::PieceSelection, tui::ProgressEvent};
 
 use super::{
     connection::{Connection, ConnectionHandle, ConnectionMessage},
-    constants::{MIN_ANNOUNCE_GAP, PEER_FLOOR, ROSTER_CAP, TARGET_LIVE_PEERS},
+    constants::{
+        END_GAME_PIECE_THRESHOLD, MIN_ANNOUNCE_GAP, PEER_FLOOR, ROSTER_CAP, TARGET_LIVE_PEERS,
+    },
     file_serializer::FileSerializer,
     peer_roster::{Lifecycle, Roster},
+    piece_layout::PieceLayout,
     tracker::{Peer, TrackerRequest, TrackerResponse},
     utils::sha1,
 };
@@ -17,69 +20,61 @@ use super::{
 #[derive(Debug)]
 pub struct Bitfield {
     value: Vec<u8>,
+    piece_count: usize,
 }
 
 impl Bitfield {
-    pub fn new(piece_number: usize) -> Self {
+    pub fn new(piece_count: usize) -> Self {
         Self {
-            value: vec![0; (piece_number as f64 / 8.0).ceil() as usize],
+            value: vec![0; piece_count.div_ceil(8)],
+            piece_count,
         }
     }
 
-    pub fn from(pieces: Vec<u8>) -> Self {
-        Self { value: pieces }
+    // A peer's bitfield is padded to a byte boundary and arrives from the
+    // network, so it is read through `piece_count` rather than trusted for its
+    // length: spare bits cannot invent pieces and a short one cannot panic.
+    pub fn from(pieces: Vec<u8>, piece_count: usize) -> Self {
+        Self {
+            value: pieces,
+            piece_count,
+        }
     }
 
     pub fn check_piece(&self, piece_index: u32) -> bool {
-        let byte_index = piece_index / 8;
-        let bit_index = piece_index % 8;
+        let byte_index = (piece_index / 8) as usize;
+        let mask = 1 << (7 - piece_index % 8);
 
-        let mask = 1 << (7 - bit_index);
-
-        return (self.value[byte_index as usize] & mask) != 0;
+        self.value
+            .get(byte_index)
+            .is_some_and(|byte| byte & mask != 0)
     }
 
     pub fn set_downloaded(&mut self, piece_index: usize) {
         let byte_index = piece_index / 8;
-        let bit_index = piece_index % 8;
-
-        let mask = 1 << (7 - bit_index);
+        let mask = 1 << (7 - piece_index % 8);
 
         self.value[byte_index] |= mask;
     }
 
+    fn indexes(&self) -> impl Iterator<Item = u32> {
+        0..self.piece_count as u32
+    }
+
     pub fn get_available_pieces(&self) -> Vec<u32> {
-        self.value
-            .iter()
-            .enumerate()
-            .flat_map(|entry| {
-                let (index, byte) = entry;
-
-                let mut indexes: Vec<u32> = vec![];
-
-                for i in 0..8 {
-                    let bit_mask = 7 - i;
-
-                    if byte & (1 << bit_mask) != 0 {
-                        indexes.push((i + (8 * index)) as u32)
-                    }
-                }
-
-                indexes
-            })
+        self.indexes()
+            .filter(|index| self.check_piece(*index))
             .collect()
     }
 
     pub fn is_completed(&self) -> bool {
-        self.value
-            .iter()
-            .all(|bitfield_section| *bitfield_section == u8::MAX)
+        self.indexes().all(|index| self.check_piece(index))
     }
 }
 
 #[derive(Debug, Clone)]
 struct Dialer {
-    piece_length: usize,
+    layout: PieceLayout,
     raw_info_hash: Vec<u8>,
     peer_id: String,
 }
@@ -92,7 +87,7 @@ impl Dialer {
             let address = peer.address();
 
             match Connection::initialize(
-                dialer.piece_length,
+                dialer.layout,
                 &dialer.raw_info_hash,
                 dialer.peer_id.as_bytes(),
                 peer,
@@ -122,6 +117,7 @@ pub enum ManagerMessage {
     Handshaking(String),
     Connected(String, ConnectionHandle),
     ConnectionFailed(String),
+    Disconnected(String),
     PieceRecieved(String, u32, Vec<u8>),
     PiecesAvailable(String, Vec<u32>),
     ChokeState(String, bool),
@@ -152,7 +148,7 @@ pub struct ConnectionManager {
 
 impl ConnectionManager {
     pub fn new(
-        piece_length: u64,
+        layout: PieceLayout,
         peers: &[Peer],
         raw_info_hash: Vec<u8>,
         peer_id: String,
@@ -166,7 +162,7 @@ impl ConnectionManager {
         let (announce_tx, announce_rx) = mpsc::channel::<()>(1);
 
         let dialer = Dialer {
-            piece_length: piece_length as usize,
+            layout,
             raw_info_hash,
             peer_id,
         };
@@ -313,17 +309,41 @@ impl ConnectionManager {
                 false
             }
             ManagerMessage::ConnectionFailed(peer_ip) => {
-                self.roster.mark(&peer_ip, Lifecycle::Failed);
-                self.connections.remove(&peer_ip);
+                self.release_peer(&peer_ip);
+                self.publish_peers();
+
+                false
+            }
+            ManagerMessage::Disconnected(peer_ip) => {
+                self.release_peer(&peer_ip);
+                self.fill_request_slots();
                 self.publish_peers();
 
                 false
             }
             ManagerMessage::ChokeState(peer_ip, choked) => {
-                if let Some(conn) = self.connections.get_mut(&peer_ip) {
-                    conn.choked = choked;
+                let Some(conn) = self.connections.get_mut(&peer_ip) else {
+                    return false;
+                };
+
+                conn.choked = choked;
+
+                // Being choked voids whatever this peer was asked for, so the
+                // slot is freed and the piece goes back to be asked elsewhere.
+                let abandoned = match choked {
+                    true => conn.current_piece.take(),
+                    false => None,
+                };
+
+                if abandoned.is_some() {
+                    conn.is_downloading = false;
                 }
 
+                if let Some(index) = abandoned {
+                    self.abandon_request(index, &peer_ip);
+                }
+
+                self.fill_request_slots();
                 self.publish_peers();
 
                 false
@@ -337,13 +357,18 @@ impl ConnectionManager {
                 // piece per peer. Only the first announcement adds a table row.
                 let joined_the_swarm = conn.available_pieces.is_empty();
 
-                conn.available_pieces.extend(&pieces);
+                // Counted once per peer per piece, so losing the peer can take
+                // exactly as much back off again.
+                let fresh = pieces
+                    .into_iter()
+                    .filter(|piece| conn.available_pieces.insert(*piece))
+                    .collect::<Vec<u32>>();
 
-                for piece in pieces {
+                for piece in fresh {
                     self.piece_availability.increment_piece(piece as usize);
                 }
 
-                self.requrest_next_piece();
+                self.fill_request_slots();
 
                 if joined_the_swarm {
                     self.publish_peers();
@@ -377,8 +402,8 @@ impl ConnectionManager {
 
                     let _ = self.progress_tx.send(ProgressEvent::HashMismatch { index });
 
-                    self.requested_pieces.remove(&index);
-                    self.requrest_next_piece();
+                    self.abandon_request(index, &from);
+                    self.fill_request_slots();
                     self.publish_peers();
 
                     return false;
@@ -398,7 +423,7 @@ impl ConnectionManager {
                         return true;
                     }
 
-                    self.requrest_next_piece();
+                    self.fill_request_slots();
                 }
 
                 self.publish_peers();
@@ -414,41 +439,29 @@ impl ConnectionManager {
             .send(ProgressEvent::Peers(self.roster.rows(&self.connections)));
     }
 
-    fn requrest_next_piece(&mut self) {
+    // Every idle peer gets something to do, and each is given the rarest piece
+    // *it* holds rather than one piece being sought globally: a single global
+    // choice leaves peers idle whenever they happen not to hold it.
+    fn fill_request_slots(&mut self) {
         if self.end_game {
             self.broadcast_end_game_requests();
             return;
         }
 
-        let index = self.piece_availability.get_next_piece_index(&self.bitfield) as u32;
+        let idle = self
+            .connections
+            .values()
+            .filter(|conn| conn.is_available())
+            .map(|conn| conn.address.clone())
+            .collect::<Vec<String>>();
 
-        let handle = self.connections.values_mut().find(|conn_handle| {
-            !conn_handle.is_downloading
-                && !conn_handle.tx.is_closed()
-                && conn_handle.available_pieces.contains(&index)
-        });
-
-        match handle {
-            Some(conn) => {
-                let _ = conn.tx.try_send(ConnectionMessage::PieceRequest(index));
-                conn.is_downloading = true;
-                conn.current_piece = Some(index);
-
-                self.requested_pieces.insert(index);
-                self.piece_owners
-                    .entry(index)
-                    .or_default()
-                    .insert(conn.address.clone());
-            }
-            None => {
-                tracing::info!(
-                    "No connection available or all connections are downloading for piece : {}",
-                    index,
-                );
+        for address in idle {
+            if let Some(index) = self.next_piece_for(&address) {
+                self.assign(&address, index);
             }
         }
 
-        if self.all_pieces_requested() {
+        if self.should_enter_end_game() {
             tracing::info!("Entering end game mode");
 
             let _ = self.progress_tx.send(ProgressEvent::EndGame);
@@ -458,9 +471,88 @@ impl ConnectionManager {
         }
     }
 
-    fn all_pieces_requested(&self) -> bool {
-        self.requested_pieces.len()
-            == self.piece_hashes.len() - (self.piece_availability.downloaded_count as usize)
+    // A peer that leaves takes its announcements with it. Without giving the
+    // counts back, availability only ever climbs and rarest-first decays into
+    // "whichever piece was announced least early".
+    fn release_peer(&mut self, address: &str) {
+        self.roster.mark(address, Lifecycle::Failed);
+
+        let Some(conn) = self.connections.remove(address) else {
+            return;
+        };
+
+        for piece in &conn.available_pieces {
+            self.piece_availability.decrement_piece(*piece as usize);
+        }
+
+        if let Some(index) = conn.current_piece {
+            self.abandon_request(index, address);
+        }
+    }
+
+    // Whatever this peer was fetching is not coming. Unless someone else was
+    // asked for it too, it goes back on the wanted list to be reassigned.
+    fn abandon_request(&mut self, index: u32, address: &str) {
+        let Some(owners) = self.piece_owners.get_mut(&index) else {
+            self.requested_pieces.remove(&index);
+            return;
+        };
+
+        owners.remove(address);
+
+        if owners.is_empty() {
+            self.piece_owners.remove(&index);
+            self.requested_pieces.remove(&index);
+        }
+    }
+
+    fn next_piece_for(&self, address: &str) -> Option<u32> {
+        let conn = self.connections.get(address)?;
+
+        self.piece_availability
+            .select(&conn.available_pieces, &self.bitfield, &self.requested_pieces)
+    }
+
+    fn assign(&mut self, address: &str, index: u32) {
+        let Some(conn) = self.connections.get_mut(address) else {
+            return;
+        };
+
+        if conn
+            .tx
+            .try_send(ConnectionMessage::PieceRequest(index))
+            .is_err()
+        {
+            return;
+        }
+
+        conn.is_downloading = true;
+        conn.current_piece = Some(index);
+
+        self.requested_pieces.insert(index);
+        self.piece_owners
+            .entry(index)
+            .or_default()
+            .insert(address.to_string());
+    }
+
+    fn missing_pieces(&self) -> impl Iterator<Item = u32> {
+        (0..self.piece_hashes.len() as u32).filter(|index| !self.bitfield.check_piece(*index))
+    }
+
+    // BEP 3 starts end game once every missing piece is spoken for. That alone
+    // can never fire if the last pieces are held only by peers that have us
+    // choked, so a small enough remainder starts it too and the tail of a
+    // download cannot sit idle waiting for an assignment it will never get.
+    fn should_enter_end_game(&self) -> bool {
+        let missing = self.missing_pieces().count();
+
+        let unassigned = self
+            .missing_pieces()
+            .filter(|index| !self.requested_pieces.contains(index))
+            .count();
+
+        missing > 0 && (unassigned == 0 || missing <= END_GAME_PIECE_THRESHOLD)
     }
 
     // End game: every remaining piece has already been assigned to one peer,
@@ -509,5 +601,79 @@ impl ConnectionManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn completed(piece_count: usize) -> Bitfield {
+        let mut bitfield = Bitfield::new(piece_count);
+
+        (0..piece_count).for_each(|index| bitfield.set_downloaded(index));
+
+        bitfield
+    }
+
+    #[test]
+    fn a_fresh_bitfield_holds_no_pieces() {
+        let bitfield = Bitfield::new(21754);
+
+        assert!(!bitfield.is_completed());
+        assert!(bitfield.get_available_pieces().is_empty());
+    }
+
+    #[test]
+    fn a_downloaded_piece_reads_back() {
+        let mut bitfield = Bitfield::new(20);
+
+        bitfield.set_downloaded(0);
+        bitfield.set_downloaded(7);
+        bitfield.set_downloaded(19);
+
+        assert_eq!(bitfield.get_available_pieces(), vec![0, 7, 19]);
+    }
+
+    // The Debian torrent has 3136 pieces and passed on the old byte-wise check
+    // by luck; the Ubuntu torrent has 21754, leaving six spare bits that could
+    // never be set, so the download could never report itself finished.
+    #[test]
+    fn a_piece_count_that_is_not_a_multiple_of_eight_can_still_complete() {
+        assert_ne!(21754 % 8, 0);
+
+        assert!(completed(21754).is_completed());
+    }
+
+    #[test]
+    fn a_piece_count_that_fills_its_last_byte_can_still_complete() {
+        assert_eq!(3136 % 8, 0);
+
+        assert!(completed(3136).is_completed());
+    }
+
+    #[test]
+    fn one_missing_piece_keeps_a_download_incomplete() {
+        let mut bitfield = completed(21754);
+
+        bitfield.value[0] &= 0b0111_1111;
+
+        assert!(!bitfield.is_completed());
+        assert!(!bitfield.check_piece(0));
+    }
+
+    #[test]
+    fn spare_bits_in_a_peers_bitfield_do_not_invent_pieces() {
+        let bitfield = Bitfield::from(vec![0xFF, 0xFF], 10);
+
+        assert_eq!(bitfield.get_available_pieces(), (0..10).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn a_peer_bitfield_shorter_than_the_torrent_reports_what_it_has() {
+        let bitfield = Bitfield::from(vec![0xFF], 21754);
+
+        assert_eq!(bitfield.get_available_pieces(), (0..8).collect::<Vec<u32>>());
+        assert!(!bitfield.check_piece(21753));
     }
 }
